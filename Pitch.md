@@ -14,6 +14,7 @@ In der heutigen digitalen Landschaft ist eine effiziente und sichere Systemverwa
 
 Zeitplan:
 
+    Phase 1
     Monat 1-2: Anforderungsanalyse und Planung
         Spezifikation der funktionalen und nicht-funktionalen Anforderungen.
         Erstellung eines detaillierten Projektplans mit Meilensteinen.
@@ -22,6 +23,7 @@ Zeitplan:
         Implementierung der automatisierten Systemüberwachung.
         Entwicklung von Modulen für die Benutzer- und Rechteverwaltung.
 
+    Phase 2
     Monat 5-6: Sicherheits- und Protokollmanagement
         Integration von Sicherheitsüberwachungsfunktionen und Firewall-Management.
         Implementierung der Protokollanalyse zur Fehlererkennung.
@@ -34,6 +36,7 @@ Zeitplan:
         Durchführung umfangreicher Tests zur Sicherstellung der Funktionalität und Sicherheit.
         Behebung identifizierter Probleme und Optimierung der Performance.
 
+    Phase 3
     Monat 9: Dokumentation und Schulung
         Erstellung von Benutzerhandbüchern und technischen Dokumentationen.
         Durchführung von Schulungen für Administratoren und Endbenutzer.
