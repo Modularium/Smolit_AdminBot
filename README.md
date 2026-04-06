@@ -23,6 +23,27 @@ Aktueller Stand:
 cargo build
 ```
 
+## Operator-CLI
+
+Die minimale Operator-CLI liegt als eigener Binary-Einstieg vor:
+
+```bash
+cargo run --bin adminbotctl -- --help
+```
+
+Unterstuetzte Befehle:
+
+- `adminbotctl status`
+- `adminbotctl health`
+- `adminbotctl policy validate`
+- `adminbotctl gate run --mode artifact|live`
+- `adminbotctl audit tail`
+- `adminbotctl restart --unit <unit> --reason <text> --confirm`
+
+Die vollstaendige Spezifikation und sichere Nutzung liegt unter:
+
+- `docs/cli/adminbotctl.md`
+
 ## Policy vorbereiten
 
 ```bash
@@ -80,10 +101,15 @@ Der verbindliche Security-Gate-Check liegt unter:
 
 - `scripts/verify_security_release_gate.sh`
 
+Das Script ist der stabile Repo-/CI-Einstiegspunkt und delegiert intern an:
+
+- `adminbotctl gate run`
+
 Repo-/CI-Check:
 
 ```bash
 bash scripts/verify_security_release_gate.sh --mode artifact
+adminbotctl gate run --mode artifact
 ```
 
 Dieser Check wird zusaetzlich automatisch in GitHub Actions erzwungen:
@@ -98,6 +124,7 @@ Zielsystem-Check:
 
 ```bash
 bash scripts/verify_security_release_gate.sh --mode live
+adminbotctl gate run --mode live
 ```
 
 ## Test via Unix Socket

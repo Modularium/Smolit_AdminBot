@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use serde::Serialize;
+
 use crate::app::App;
 use crate::error::{AppError, ErrorCode};
 use crate::peer::{get_peer_credentials, gid_from_group_name, set_socket_group};
@@ -172,7 +174,7 @@ impl IpcServer {
     }
 
     #[cfg(test)]
-    fn bind_for_test(socket_path: PathBuf) -> io::Result<Self> {
+    pub(crate) fn bind_for_test(socket_path: PathBuf) -> io::Result<Self> {
         if let Some(parent) = socket_path.parent() {
             fs::create_dir_all(parent)?;
             fs::set_permissions(parent, fs::Permissions::from_mode(RUNTIME_DIRECTORY_MODE))?;
@@ -219,7 +221,11 @@ pub fn read_frame(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
 }
 
 pub fn write_frame(stream: &mut UnixStream, response: &Response) -> io::Result<()> {
-    write_frame_to_writer(stream, response)
+    write_json_frame(stream, response)
+}
+
+pub fn write_json_frame<T: Serialize>(writer: &mut impl Write, value: &T) -> io::Result<()> {
+    write_frame_to_writer(writer, value)
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -506,8 +512,8 @@ impl AdmissionControl {
     }
 }
 
-fn write_frame_to_writer<W: Write>(writer: &mut W, response: &Response) -> io::Result<()> {
-    let payload = serde_json::to_vec(response)
+fn write_frame_to_writer<T: Serialize, W: Write>(writer: &mut W, value: &T) -> io::Result<()> {
+    let payload = serde_json::to_vec(value)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     let length = payload.len() as u32;
     writer.write_all(&length.to_be_bytes())?;
