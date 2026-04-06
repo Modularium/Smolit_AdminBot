@@ -586,4 +586,62 @@ allowed_units = ["nginx.service"]
             .expect_err("agent should not get service_control");
         assert_eq!(error.code, ErrorCode::CapabilityDenied);
     }
+
+    #[test]
+    fn service_restart_cooldown_is_held_per_unit() {
+        let path = write_policy_file(
+            r#"
+version = 1
+
+[actions]
+allowed = ["service.restart"]
+
+[service_control]
+allowed_units = ["nginx.service", "sshd.service"]
+restart_cooldown_seconds = 300
+max_restarts_per_hour = 3
+"#,
+        );
+
+        let engine = PolicyEngine::load_from_path(path.clone()).expect("load policy");
+        remove_policy_file(&path);
+
+        engine.record_service_restart("nginx.service");
+
+        let cooldown_error = engine
+            .check_service_restart_allowed("nginx.service")
+            .expect_err("nginx should be in cooldown");
+        assert_eq!(cooldown_error.code, ErrorCode::CooldownActive);
+
+        engine
+            .check_service_restart_allowed("sshd.service")
+            .expect("other unit should remain allowed");
+    }
+
+    #[test]
+    fn service_restart_rate_limit_returns_rate_limited() {
+        let path = write_policy_file(
+            r#"
+version = 1
+
+[actions]
+allowed = ["service.restart"]
+
+[service_control]
+allowed_units = ["nginx.service"]
+restart_cooldown_seconds = 0
+max_restarts_per_hour = 1
+"#,
+        );
+
+        let engine = PolicyEngine::load_from_path(path.clone()).expect("load policy");
+        remove_policy_file(&path);
+
+        engine.record_service_restart("nginx.service");
+
+        let error = engine
+            .check_service_restart_allowed("nginx.service")
+            .expect_err("rate limit should be enforced");
+        assert_eq!(error.code, ErrorCode::RateLimited);
+    }
 }
