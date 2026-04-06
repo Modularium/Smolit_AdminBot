@@ -329,7 +329,8 @@ Begründung:
         "timestamp": "RFC3339 string",
         "unit": "nginx.service",
         "priority": "warning",
-        "message": "string"
+        "message": "string",
+        "message_truncated": false
       }
     ],
     "truncated": false
@@ -339,6 +340,8 @@ Begründung:
   - `limit` hart begrenzt
   - `since_seconds` hart begrenzt
   - `unit` nur wenn Policy erlaubt
+  - einzelne Journalnachrichten werden auf `2048 Bytes` begrenzt
+  - die gesamte JSON-Antwort wird auf `32768 Bytes` begrenzt
 - Side Effects:
   - keine
 - Dry-Run:
