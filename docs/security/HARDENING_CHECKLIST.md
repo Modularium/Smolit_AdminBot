@@ -41,6 +41,7 @@
 [x] unbekannte Felder werden in Kernstrukturen abgewiesen
 [x] `request_id` muss UUID sein
 [x] maximale IPC-Frame-Groesse auf `64 KiB` definieren und technisch erzwingen
+[x] ausgehende IPC-Responses sind auf dieselbe `64 KiB`-Frame-Grenze begrenzt
 [x] Socket-Read-Timeouts mit konservativem Default von `1000 ms` definieren
 [x] Socket-Write-Timeouts mit konservativem Default von `1000 ms` definieren
 [ ] Schutz gegen Slow-Client-Blockade definieren
@@ -64,6 +65,8 @@
 [x] `max_parallel_mutations` aktiv technisch erzwingen; mutierende Non-Dry-Run-Requests werden ueber dem Policy-Limit fail-fast mit `rate_limited` abgewiesen
 [x] mutierende Non-Dry-Run-Requests binden `request_id` peer-gebunden fuer `300 s`; identische Replays liefern denselben Response, mismatched Reuse wird abgewiesen
 [x] Restart-Abuse-Zaehler werden unter `/var/lib/adminbot/restart_abuse_state.json` persistiert; unsichere oder kaputte Persistenz blockiert `service.restart` fail closed
+[x] deterministische Policy-Sanity-Warnungen fuer breite Legacy-Capabilities und fehlende `journal.allowed_units` sind vorhanden
+[x] `fail_on_sanity_warnings` kann unsichere, aber syntaktisch valide Policies beim Start fail closed blockieren
 
 ## Action- und Backend-Sicherheit
 

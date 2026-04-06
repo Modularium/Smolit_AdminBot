@@ -159,22 +159,43 @@ fn execute_command<R: BufRead, W: Write>(
         }
         Command::PolicyValidate { path, json } => {
             let report = validate_policy(path.as_path())?;
+            let fail_closed = report.would_fail_closed();
             if json {
-                writeln!(
-                    stdout,
-                    "{}",
-                    serde_json::to_string_pretty(&report).map_err(|error| {
-                        CliError::new(format!(
-                            "unable to encode policy validation output: {error}"
-                        ))
-                    })?
-                )
-                .map_err(|error| CliError::new(format!("unable to write stdout: {error}")))?;
+                if fail_closed {
+                    return Err(CliError::new(
+                        "policy sanity warnings are configured to fail closed",
+                    )
+                    .with_json(json!({
+                        "status": "error",
+                        "error": {"message": "policy sanity warnings are configured to fail closed"},
+                        "report": report
+                    })));
+                } else {
+                    writeln!(
+                        stdout,
+                        "{}",
+                        serde_json::to_string_pretty(&report).map_err(|error| {
+                            CliError::new(format!(
+                                "unable to encode policy validation output: {error}"
+                            ))
+                        })?
+                    )
+                    .map_err(|error| CliError::new(format!("unable to write stdout: {error}")))?;
+                }
             } else {
                 writeln!(stdout, "{}", render_policy_report_human(&report))
                     .map_err(|error| CliError::new(format!("unable to write stdout: {error}")))?;
             }
-            Ok(())
+            if fail_closed {
+                Err(CliError::new("policy sanity warnings are configured to fail closed")
+                    .with_json(json!({
+                        "status": "error",
+                        "error": {"message": "policy sanity warnings are configured to fail closed"},
+                        "report": report
+                    })))
+            } else {
+                Ok(())
+            }
         }
         Command::GateRun { options, json } => {
             let report = run_gate(&options);
@@ -344,10 +365,18 @@ struct PolicyValidationReport {
     syntax_semantics_valid: bool,
     deployment_checks_applied: bool,
     deployment_checks_valid: Option<bool>,
+    fail_on_sanity_warnings: bool,
+    warnings: Vec<crate::policy::PolicySanityWarning>,
+}
+
+impl PolicyValidationReport {
+    fn would_fail_closed(&self) -> bool {
+        self.fail_on_sanity_warnings && !self.warnings.is_empty()
+    }
 }
 
 fn validate_policy(path: &Path) -> Result<PolicyValidationReport, CliError> {
-    PolicyEngine::load_from_path(path.to_path_buf())
+    let inspection = PolicyEngine::inspect_policy_file(path)
         .map_err(|error| CliError::new(format!("policy syntax/semantics invalid: {error}")))?;
 
     let deployment_checks_applied = path == Path::new(DEFAULT_POLICY_PATH);
@@ -364,11 +393,13 @@ fn validate_policy(path: &Path) -> Result<PolicyValidationReport, CliError> {
         syntax_semantics_valid: true,
         deployment_checks_applied,
         deployment_checks_valid,
+        fail_on_sanity_warnings: inspection.fail_on_sanity_warnings,
+        warnings: inspection.warnings,
     })
 }
 
 fn render_policy_report_human(report: &PolicyValidationReport) -> String {
-    if report.deployment_checks_applied {
+    let mut lines = vec![if report.deployment_checks_applied {
         format!(
             "PASS: {} syntax/semantics valid; deployment owner/mode valid",
             report.path
@@ -378,7 +409,26 @@ fn render_policy_report_human(report: &PolicyValidationReport) -> String {
             "PASS: {} syntax/semantics valid; deployment owner/mode skipped for custom path",
             report.path
         )
+    }];
+
+    if !report.warnings.is_empty() {
+        lines.push(format!("Warnings: {}", report.warnings.len()));
+        for warning in &report.warnings {
+            lines.push(format!(
+                "- {} ({}): {}",
+                warning.code, warning.policy_section, warning.message
+            ));
+        }
     }
+
+    if report.would_fail_closed() {
+        lines.push(
+            "FAIL CLOSED: fail_on_sanity_warnings=true and policy sanity warnings are present"
+                .to_string(),
+        );
+    }
+
+    lines.join("\n")
 }
 
 fn render_gate_report_human(report: &GateReport) -> String {
@@ -946,6 +996,103 @@ mod tests {
         assert!(output.contains("SECURITY RELEASE GATE: FAIL"));
         let _ = fs::remove_file(broken_policy);
         let _ = fs::remove_dir(temp_dir);
+    }
+
+    #[test]
+    fn policy_validate_reports_sanity_warnings_without_failing_by_default() {
+        let policy_path = write_temp_file(
+            "policy-warnings",
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "dev"
+allowed_capabilities = ["read_basic", "read_sensitive", "service_control"]
+
+[actions]
+allowed = ["system.status", "journal.query", "service.restart"]
+denied = []
+
+[service_control]
+allowed_units = ["adminbotd.service", "nginx.service"]
+"#,
+        );
+
+        let mut stdin = Cursor::new(Vec::<u8>::new());
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit_code = run_with(
+            vec![
+                "adminbotctl".to_string(),
+                "policy".to_string(),
+                "validate".to_string(),
+                "--path".to_string(),
+                policy_path.display().to_string(),
+            ],
+            &mut stdin,
+            &mut stdout,
+            &mut stderr,
+            false,
+        );
+
+        assert_eq!(exit_code, 0);
+        let output = String::from_utf8(stdout).expect("utf8 stdout");
+        assert!(output.contains("Warnings: 3"));
+        assert!(output.contains("legacy_read_sensitive_capability"));
+        assert!(output.contains("legacy_service_control_capability"));
+        assert!(output.contains("journal_scope_falls_back_to_service_units"));
+        let _ = fs::remove_file(policy_path);
+    }
+
+    #[test]
+    fn policy_validate_fails_when_sanity_warnings_are_configured_fail_closed() {
+        let policy_path = write_temp_file(
+            "policy-fail-closed",
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "dev"
+allowed_capabilities = ["read_sensitive"]
+
+[actions]
+allowed = ["system.status"]
+denied = []
+
+[constraints]
+fail_on_sanity_warnings = true
+"#,
+        );
+
+        let mut stdin = Cursor::new(Vec::<u8>::new());
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit_code = run_with(
+            vec![
+                "adminbotctl".to_string(),
+                "policy".to_string(),
+                "validate".to_string(),
+                "--path".to_string(),
+                policy_path.display().to_string(),
+                "--json".to_string(),
+            ],
+            &mut stdin,
+            &mut stdout,
+            &mut stderr,
+            false,
+        );
+
+        assert_eq!(exit_code, 1);
+        let output: Value = serde_json::from_slice(&stdout).expect("json stdout");
+        assert_eq!(
+            output["error"]["message"],
+            "policy sanity warnings are configured to fail closed"
+        );
+        assert_eq!(output["report"]["fail_on_sanity_warnings"], true);
+        assert!(output["report"]["warnings"]
+            .as_array()
+            .is_some_and(|warnings| !warnings.is_empty()));
+        let _ = fs::remove_file(policy_path);
     }
 
     #[test]
