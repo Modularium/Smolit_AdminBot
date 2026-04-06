@@ -83,6 +83,14 @@ Repo-/CI-Check:
 bash scripts/verify_security_release_gate.sh --mode artifact
 ```
 
+Dieser Check wird zusaetzlich automatisch in GitHub Actions erzwungen:
+
+- Workflow: `.github/workflows/security-gate.yml`
+- Pflicht fuer Pull Requests
+- Pflicht fuer Pushes auf `dev` und `main`
+
+Ein PR gilt damit nicht als security-sauber, wenn das `artifact`-Gate fehlschlaegt.
+
 Zielsystem-Check:
 
 ```bash
