@@ -121,9 +121,9 @@ Dieses Dokument haelt die sicherheitsrelevanten Entscheidungen fuer die Nachhaer
 
 - Prioritaet: `P2`
 - GitHub-Issue: `#85`
-- Entscheidung: weitere systemd-Hardening-Optionen werden gezielt gegen reale Funktionsanforderungen geprueft.
+- Entscheidung: die versionierte `adminbotd.service` wird ueber die Baseline hinaus mit `UMask=0077`, `ProtectClock=true`, `ProtectHostname=true`, `ProtectControlGroups=true`, `ProtectKernelTunables=true`, `ProtectKernelModules=true`, `ProtectKernelLogs=true`, `RestrictSUIDSGID=true`, `RestrictNamespaces=true`, `SystemCallArchitectures=native` und `RemoveIPC=true` gehaertet. Diese Flags werden zugleich Teil des verbindlichen Security Release Gates.
 - Begruendung: die aktuelle Baseline ist gut, aber noch nicht maximal reduziert.
-- Nicht Ziel: blinde Aktivierung aller systemd-Optionen ohne Funktionspruefung.
+- Nicht Ziel: blinde Aktivierung aller systemd-Optionen ohne Funktionspruefung, insbesondere `ProtectProc=` und `SystemCallFilter=` ohne gesonderten Betriebsnachweis.
 
 ## Entscheidung 16: Audit-Retention und Journald-Exposure werden betrieblich definiert
 
