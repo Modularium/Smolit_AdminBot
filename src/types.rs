@@ -3,7 +3,7 @@ use serde_json::{Map, Value};
 
 use crate::error::ErrorBody;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RequestOriginType {
     Human,
