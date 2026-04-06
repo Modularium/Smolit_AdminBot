@@ -212,6 +212,9 @@ allowed = [
 ]
 denied = []
 
+[filesystem]
+allowed_mounts = ["/", "/var"]
+
 [service_control]
 allowed_units = ["nginx.service", "ssh.service"]
 restart_cooldown_seconds = 300
@@ -239,6 +242,12 @@ Mögliche Match-Kriterien in `v1`:
 ### `actions`
 
 Globale Positivliste für den Daemon.
+
+### `filesystem`
+
+- kleine statische Whitelist fuer read-only Mountpoints
+- `allowed_mounts` definiert die einzigen fuer `disk.usage` erlaubten Mountpoints in `v1`
+- keine freie Dateisystemauswahl
 
 ### `service_control`
 
