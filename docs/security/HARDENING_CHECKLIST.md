@@ -50,7 +50,7 @@
 [x] Service-Unit-Whitelist existiert
 [x] Restart-Cooldown existiert
 [x] Restart-Rate-Limit existiert
-[ ] Eigentuemer und Modus von `/etc/adminbot/policy.toml` beim Deployment hart pruefen
+[x] Eigentuemer und Modus von `/etc/adminbot/policy.toml` beim Start hart pruefen: root-owned, nicht group-writable, nicht world-writable
 [ ] Policy-Integritaet oder Change-Control dokumentieren
 [x] `allowed_request_types` nicht mehr fuer Autorisierung verwenden; getrennte Unix-User oder -Gruppen fuer getrennte Rollen erzwingen
 [ ] `max_parallel_mutations` aktiv technisch erzwingen

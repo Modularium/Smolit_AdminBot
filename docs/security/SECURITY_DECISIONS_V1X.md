@@ -49,7 +49,7 @@ Dieses Dokument haelt die sicherheitsrelevanten Entscheidungen fuer die Nachhaer
 
 - Prioritaet: `P0`
 - GitHub-Issue: `#76`
-- Entscheidung: `/etc/adminbot/policy.toml` wird als sicherheitskritisches Artefakt behandelt und bei ungueltigem Owner oder Modus abgelehnt.
+- Entscheidung: `/etc/adminbot/policy.toml` wird als sicherheitskritisches Artefakt behandelt und bei ungueltigem Owner oder Modus abgelehnt. Erwartet wird root-owned sowie weder group- noch world-writable.
 - Begruendung: Policy-Manipulation unterlaeuft die zentrale Sicherheitsgrenze von AdminBot.
 - Nicht Ziel: komplexes Secret-Management-System.
 
