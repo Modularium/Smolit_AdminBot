@@ -16,7 +16,7 @@ Dieses Dokument haelt die sicherheitsrelevanten Entscheidungen fuer die Nachhaer
 
 - Prioritaet: `P0`
 - GitHub-Issue: `#72`
-- Entscheidung: der Daemon darf langsame Clients nicht unbegrenzt bedienen.
+- Entscheidung: der Daemon darf langsame Clients nicht unbegrenzt bedienen und setzt einen konservativen IPC-Read-Timeout von `1000 ms`.
 - Begruendung: Slow-Client-DoS ist bei sequentieller Verarbeitung ein realistisches lokales Risiko.
 - Nicht Ziel: parallele Komplettarchitektur in diesem Schritt.
 

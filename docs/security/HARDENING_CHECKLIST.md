@@ -33,7 +33,7 @@
 [x] unbekannte Felder werden in Kernstrukturen abgewiesen
 [x] `request_id` muss UUID sein
 [x] maximale IPC-Frame-Groesse auf `64 KiB` definieren und technisch erzwingen
-[ ] Socket-Read-Timeouts definieren
+[x] Socket-Read-Timeouts mit konservativem Default von `1000 ms` definieren
 [ ] Socket-Write-Timeouts definieren
 [ ] Schutz gegen Slow-Client-Blockade definieren
 [ ] Request-Flooding und lokale Admission-Control bewerten
