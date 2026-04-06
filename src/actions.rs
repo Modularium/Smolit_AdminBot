@@ -10,12 +10,12 @@ use serde_json::{json, Value};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 use uuid::Uuid;
-use zbus::blocking::{Connection, Proxy};
 use zbus::zvariant::OwnedObjectPath;
 
 use crate::app::App;
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::policy::Capability;
+use crate::systemd::SystemdClient;
 use crate::types::Request;
 
 #[derive(Debug, Clone, Copy)]
@@ -800,29 +800,8 @@ fn service_restart(app: &App, request: &Request) -> AppResult<Value> {
         }));
     }
 
-    let connection = Connection::system().map_err(|error| {
-        AppError::new(
-            ErrorCode::BackendUnavailable,
-            "unable to connect to system bus",
-        )
-        .with_detail("source", error.to_string())
-        .retryable(true)
-    })?;
-
-    let proxy = Proxy::new(
-        &connection,
-        "org.freedesktop.systemd1",
-        "/org/freedesktop/systemd1",
-        "org.freedesktop.systemd1.Manager",
-    )
-    .map_err(|error| {
-        AppError::new(
-            ErrorCode::BackendUnavailable,
-            "unable to create systemd manager proxy",
-        )
-        .with_detail("source", error.to_string())
-        .retryable(true)
-    })?;
+    let systemd = SystemdClient::connect()?;
+    let proxy = systemd.manager_proxy()?;
 
     let job_path: OwnedObjectPath = proxy
         .call("RestartUnit", &(params.unit.as_str(), "replace"))
@@ -856,46 +835,9 @@ fn service_restart(app: &App, request: &Request) -> AppResult<Value> {
 fn fetch_service_status(unit: &str) -> AppResult<ServiceStatusView> {
     validate_unit(unit)?;
 
-    let connection = Connection::system().map_err(|error| {
-        AppError::new(
-            ErrorCode::BackendUnavailable,
-            "unable to connect to system bus",
-        )
-        .with_detail("source", error.to_string())
-        .retryable(true)
-    })?;
-
-    let manager = Proxy::new(
-        &connection,
-        "org.freedesktop.systemd1",
-        "/org/freedesktop/systemd1",
-        "org.freedesktop.systemd1.Manager",
-    )
-    .map_err(|error| {
-        AppError::new(
-            ErrorCode::BackendUnavailable,
-            "unable to create systemd manager proxy",
-        )
-        .with_detail("source", error.to_string())
-        .retryable(true)
-    })?;
-
-    let path: OwnedObjectPath = manager.call("LoadUnit", &(unit,)).map_err(|error| {
-        AppError::new(ErrorCode::ExecutionFailed, "unable to load unit")
-            .with_detail("source", error.to_string())
-    })?;
-
-    let unit_proxy = Proxy::new(
-        &connection,
-        "org.freedesktop.systemd1",
-        path.as_str(),
-        "org.freedesktop.systemd1.Unit",
-    )
-    .map_err(|error| {
-        AppError::new(ErrorCode::BackendUnavailable, "unable to create unit proxy")
-            .with_detail("source", error.to_string())
-            .retryable(true)
-    })?;
+    let systemd = SystemdClient::connect()?;
+    let path = systemd.load_unit_path(unit)?;
+    let unit_proxy = systemd.unit_proxy(path.as_str())?;
 
     let active_state = unit_proxy
         .get_property::<String>("ActiveState")
