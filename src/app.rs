@@ -281,6 +281,110 @@ denied = []
         }
     }
 
+    #[test]
+    fn system_health_returns_expected_check_set() {
+        let app = App::new(policy_for_current_user(
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "__USER__"
+allowed_capabilities = ["read_basic"]
+
+[actions]
+allowed = ["system.health"]
+denied = []
+"#,
+        ));
+
+        let request = Request {
+            version: 1,
+            request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62576".to_string(),
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Human,
+                id: "test-cli".to_string(),
+            },
+            action: "system.health".to_string(),
+            params: serde_json::from_value(json!({})).expect("params"),
+            dry_run: false,
+            timeout_ms: 3000,
+        };
+
+        let response = app.handle_request(request, current_peer());
+        match response {
+            Response::Success(success) => {
+                assert!(success.result["overall_status"].is_string());
+                let checks = success.result["checks"].as_array().expect("checks array");
+                assert_eq!(checks.len(), 4);
+
+                let names: Vec<&str> = checks
+                    .iter()
+                    .map(|check| check["name"].as_str().expect("check name"))
+                    .collect();
+                assert_eq!(names, vec!["cpu", "memory", "disk_root", "swap"]);
+
+                assert!(success.result["warnings"].is_array());
+            }
+            Response::Error(error) => panic!("unexpected error response: {:?}", error),
+        }
+    }
+
+    #[test]
+    fn system_health_overall_status_is_deterministic() {
+        let app = App::new(policy_for_current_user(
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "__USER__"
+allowed_capabilities = ["read_basic"]
+
+[actions]
+allowed = ["system.health"]
+denied = []
+"#,
+        ));
+
+        let request = Request {
+            version: 1,
+            request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62577".to_string(),
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Human,
+                id: "test-cli".to_string(),
+            },
+            action: "system.health".to_string(),
+            params: serde_json::from_value(json!({})).expect("params"),
+            dry_run: false,
+            timeout_ms: 3000,
+        };
+
+        let response = app.handle_request(request, current_peer());
+        match response {
+            Response::Success(success) => {
+                let overall = success.result["overall_status"]
+                    .as_str()
+                    .expect("overall status");
+                let checks = success.result["checks"].as_array().expect("checks array");
+
+                let has_critical = checks
+                    .iter()
+                    .any(|check| check["status"].as_str() == Some("critical"));
+                let has_warning = checks
+                    .iter()
+                    .any(|check| check["status"].as_str() == Some("warning"));
+
+                if has_critical {
+                    assert_eq!(overall, "critical");
+                } else if has_warning {
+                    assert_eq!(overall, "degraded");
+                } else {
+                    assert_eq!(overall, "ok");
+                }
+            }
+            Response::Error(error) => panic!("unexpected error response: {:?}", error),
+        }
+    }
+
     fn current_peer() -> PeerCredentials {
         PeerCredentials {
             uid: unsafe { libc::geteuid() },
