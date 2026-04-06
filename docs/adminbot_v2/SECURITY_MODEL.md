@@ -247,6 +247,15 @@ Nicht fuer Autorisierung vertrauenswuerdig in `v1.x`:
 - `requested_by.id`
 - `allowed_request_types` als alleinige Rollentrennung fuer dieselbe OS-Identitaet
 
+### Deployment-Invariante fuer die Policy-Datei
+
+- `/etc/adminbot/policy.toml` ist ein sicherheitskritisches Artefakt
+- `adminbotd` startet fail closed, wenn die Datei
+  - nicht root-owned ist
+  - group-writable ist
+  - world-writable ist
+  - kein regulaeres File ist
+
 ### `actions`
 
 Globale Positivliste für den Daemon.

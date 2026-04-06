@@ -28,9 +28,12 @@ cargo build
 ```bash
 sudo install -d -m 0755 /etc/adminbot
 sudo install -m 0644 config/policy.example.toml /etc/adminbot/policy.toml
+sudo chown root:root /etc/adminbot/policy.toml
 ```
 
 Die Beispielpolicy ist bewusst konservativ und gibt dem lokalen Beispielclient nur Read-only-Capabilities.
+
+`adminbotd` startet fail closed, wenn `/etc/adminbot/policy.toml` nicht root-owned ist oder group-/world-writable bleibt.
 
 Wichtig fuer `v1.x`:
 

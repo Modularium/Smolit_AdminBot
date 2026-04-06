@@ -25,7 +25,9 @@ fn main() {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let policy = PolicyEngine::load_from_path(PathBuf::from(DEFAULT_POLICY_PATH))?;
+    let policy_path = PathBuf::from(DEFAULT_POLICY_PATH);
+    PolicyEngine::validate_policy_file(&policy_path)?;
+    let policy = PolicyEngine::load_from_path(policy_path)?;
     let app = App::new(policy);
     let server = IpcServer::bind(PathBuf::from(DEFAULT_SOCKET_PATH), "adminbotctl")?;
     server.run(&app)?;

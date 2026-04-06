@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
@@ -10,6 +11,9 @@ use crate::actions::ActionMetadata;
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::peer::{gid_from_group_name, PeerCredentials};
 use crate::types::{Request, RequestOriginType};
+
+pub const EXPECTED_POLICY_OWNER_UID: u32 = 0;
+pub const POLICY_FORBIDDEN_MODE_BITS: u32 = 0o022;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -136,6 +140,10 @@ pub struct PolicyEngine {
 }
 
 impl PolicyEngine {
+    pub fn validate_policy_file(path: &std::path::Path) -> AppResult<()> {
+        validate_policy_file_for_owner(path, EXPECTED_POLICY_OWNER_UID)
+    }
+
     pub fn load_from_path(path: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
         let content = fs::read_to_string(path)?;
         let parsed: PolicyFile = toml::from_str(&content)?;
@@ -357,6 +365,52 @@ impl PolicyEngine {
     }
 }
 
+fn validate_policy_file_for_owner(path: &std::path::Path, expected_uid: u32) -> AppResult<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        AppError::new(
+            ErrorCode::PreconditionFailed,
+            "policy file is missing or unreadable",
+        )
+        .with_detail("path", path.display().to_string())
+        .with_detail("source", error.to_string())
+    })?;
+
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(AppError::new(
+            ErrorCode::PreconditionFailed,
+            "policy path must be a regular file",
+        )
+        .with_detail("path", path.display().to_string()));
+    }
+
+    let owner_uid = metadata.uid();
+    if owner_uid != expected_uid {
+        return Err(AppError::new(
+            ErrorCode::PreconditionFailed,
+            "policy file owner is not trusted",
+        )
+        .with_detail("path", path.display().to_string())
+        .with_detail("owner_uid", owner_uid as u64)
+        .with_detail("expected_owner_uid", expected_uid as u64));
+    }
+
+    let mode = metadata.mode() & 0o777;
+    if mode & POLICY_FORBIDDEN_MODE_BITS != 0 {
+        return Err(AppError::new(
+            ErrorCode::PreconditionFailed,
+            "policy file mode is too permissive",
+        )
+        .with_detail("path", path.display().to_string())
+        .with_detail("mode", format!("{mode:o}"))
+        .with_detail(
+            "forbidden_mode_bits",
+            format!("{:o}", POLICY_FORBIDDEN_MODE_BITS),
+        ));
+    }
+
+    Ok(())
+}
+
 impl std::fmt::Display for Capability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let value = match self {
@@ -374,6 +428,7 @@ mod tests {
     use super::*;
 
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::process;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -398,6 +453,10 @@ mod tests {
 
     fn remove_policy_file(path: &PathBuf) {
         let _ = fs::remove_file(path);
+    }
+
+    fn current_uid() -> u32 {
+        unsafe { libc::geteuid() }
     }
 
     #[test]
@@ -505,6 +564,66 @@ allowed = ["system.status"]
         let message = error.to_string();
         assert!(message.contains("unknown field"));
         assert!(message.contains("unexpected_field"));
+    }
+
+    #[test]
+    fn policy_file_validation_rejects_world_writable_mode() {
+        let path = write_policy_file(
+            r#"
+version = 1
+
+[actions]
+allowed = ["system.status"]
+"#,
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).expect("chmod");
+
+        let error = validate_policy_file_for_owner(&path, current_uid())
+            .expect_err("world-writable policy must fail");
+        remove_policy_file(&path);
+
+        assert_eq!(error.code, ErrorCode::PreconditionFailed);
+        assert_eq!(error.message, "policy file mode is too permissive");
+    }
+
+    #[test]
+    fn policy_file_validation_rejects_unexpected_owner() {
+        let path = write_policy_file(
+            r#"
+version = 1
+
+[actions]
+allowed = ["system.status"]
+"#,
+        );
+
+        let expected_uid = current_uid().saturating_add(1);
+        let error =
+            validate_policy_file_for_owner(&path, expected_uid).expect_err("wrong owner must fail");
+        remove_policy_file(&path);
+
+        assert_eq!(error.code, ErrorCode::PreconditionFailed);
+        assert_eq!(error.message, "policy file owner is not trusted");
+        assert_eq!(
+            error.details.get("expected_owner_uid"),
+            Some(&serde_json::json!(expected_uid as u64))
+        );
+    }
+
+    #[test]
+    fn policy_file_validation_accepts_trusted_owner_and_mode() {
+        let path = write_policy_file(
+            r#"
+version = 1
+
+[actions]
+allowed = ["system.status"]
+"#,
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).expect("chmod");
+
+        validate_policy_file_for_owner(&path, current_uid()).expect("trusted file must pass");
+        remove_policy_file(&path);
     }
 
     #[test]
