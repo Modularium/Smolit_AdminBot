@@ -56,6 +56,7 @@ Der Daemon erwartet standardmäßig:
 - Policy: `/etc/adminbot/policy.toml`
 - Socket: `/run/adminbot/adminbot.sock`
 - Socket-Gruppe: `adminbotctl`
+- Restart-Abuse-State: `/var/lib/adminbot/restart_abuse_state.json`
 
 Vor dem Start:
 
@@ -64,6 +65,7 @@ sudo install -d -o adminbot -g adminbot -m 0750 /run/adminbot
 ```
 
 `adminbotd` startet fail closed, wenn `/run/adminbot` nicht das erwartete Runtime-Verzeichnis ist oder wenn unter `/run/adminbot/adminbot.sock` ein unsicheres Alt-Artefakt liegt.
+Fuer `service.restart` gilt zusaetzlich: der Daemon erwartet ein sicheres, beschreibbares State-Artefakt unter `/var/lib/adminbot/restart_abuse_state.json`. Wenn dieses Artefakt untrusted oder nicht persistierbar ist, wird der Restart-Pfad fail closed blockiert.
 
 Dann:
 

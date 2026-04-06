@@ -113,7 +113,7 @@ Dieses Dokument haelt die sicherheitsrelevanten Entscheidungen fuer die Nachhaer
 
 - Prioritaet: `P2`
 - GitHub-Issue: `#84`
-- Entscheidung: Restart-Abuse-Schutz wird ueber Neustarts hinweg robuster gemacht oder betrieblich gleichwertig abgesichert.
+- Entscheidung: Restart-Abuse-Zaehler werden als einzelnes lokales State-Artefakt unter `/var/lib/adminbot/restart_abuse_state.json` persistiert. Das Artefakt muss dem laufenden `adminbotd` gehoeren, regulaer sein und darf weder group- noch world-accessible sein; wenn Laden oder Persistieren fehlschlaegt, wird `service.restart` fail closed blockiert.
 - Begruendung: volatile Schutzzaehler sind fuer laenger laufende Systeme schwach.
 - Nicht Ziel: komplexe persistente Telemetrieplattform.
 
