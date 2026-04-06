@@ -1,4 +1,6 @@
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
@@ -277,11 +279,10 @@ fn execute_handler(app: &App, request: &Request, handler: ActionHandler) -> AppR
         ActionHandler::SystemHealth => system_health(),
         ActionHandler::ResourceSnapshot => resource_snapshot(),
         ActionHandler::DiskUsage => disk_usage(request),
+        ActionHandler::NetworkInterfaceStatus => network_interface_status(request),
         ActionHandler::ServiceStatus => service_status(request),
         ActionHandler::ServiceRestart => service_restart(app, request),
-        ActionHandler::NetworkInterfaceStatus
-        | ActionHandler::JournalQuery
-        | ActionHandler::ProcessSnapshot => Err(AppError::new(
+        ActionHandler::JournalQuery | ActionHandler::ProcessSnapshot => Err(AppError::new(
             ErrorCode::BackendUnavailable,
             "action is registered but not implemented in this minimal build",
         )),
@@ -531,6 +532,26 @@ fn disk_usage(request: &Request) -> AppResult<Value> {
         }));
     }
     Ok(json!({ "mounts": mounts }))
+}
+
+fn network_interface_status(request: &Request) -> AppResult<Value> {
+    let interfaces = extract_interface_names(&request.params_value())?;
+    let stats = read_network_device_stats()?;
+    let mut result = Vec::new();
+
+    for interface in interfaces {
+        let addresses = read_interface_addresses(&interface)?;
+        let (rx_bytes, tx_bytes) = stats.get(&interface).copied().unwrap_or((0, 0));
+        result.push(json!({
+            "name": interface,
+            "state": read_interface_state(&interface),
+            "addresses": addresses,
+            "rx_bytes": rx_bytes,
+            "tx_bytes": tx_bytes
+        }));
+    }
+
+    Ok(json!({ "interfaces": result }))
 }
 
 fn service_status(request: &Request) -> AppResult<Value> {
@@ -924,6 +945,80 @@ fn read_network_totals() -> AppResult<Value> {
         "rx_bytes": rx_bytes,
         "tx_bytes": tx_bytes
     }))
+}
+
+fn read_network_device_stats() -> AppResult<HashMap<String, (u64, u64)>> {
+    let content = fs::read_to_string("/proc/net/dev")
+        .map_err(|_| AppError::new(ErrorCode::ExecutionFailed, "unable to read network stats"))?;
+    let mut stats = HashMap::new();
+
+    for line in content.lines().skip(2) {
+        let Some((name, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let columns: Vec<&str> = rest.split_whitespace().collect();
+        if columns.len() < 16 {
+            continue;
+        }
+        let interface = name.trim().to_string();
+        let rx_bytes = columns[0].parse::<u64>().unwrap_or(0);
+        let tx_bytes = columns[8].parse::<u64>().unwrap_or(0);
+        stats.insert(interface, (rx_bytes, tx_bytes));
+    }
+
+    Ok(stats)
+}
+
+fn read_interface_state(interface: &str) -> &'static str {
+    let path = format!("/sys/class/net/{interface}/operstate");
+    match fs::read_to_string(path) {
+        Ok(state) => match state.trim() {
+            "up" => "up",
+            "down" => "down",
+            _ => "unknown",
+        },
+        Err(_) => "unknown",
+    }
+}
+
+fn read_interface_addresses(interface: &str) -> AppResult<Vec<String>> {
+    let mut addresses = BTreeSet::new();
+    let mut addrs = std::ptr::null_mut();
+    let result = unsafe { libc::getifaddrs(&mut addrs) };
+    if result != 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut current = addrs;
+    while !current.is_null() {
+        let ifaddr = unsafe { &*current };
+        if !ifaddr.ifa_name.is_null() {
+            let name = unsafe { std::ffi::CStr::from_ptr(ifaddr.ifa_name) }
+                .to_string_lossy()
+                .into_owned();
+            if name == interface && !ifaddr.ifa_addr.is_null() {
+                let family = unsafe { (*ifaddr.ifa_addr).sa_family as i32 };
+                match family {
+                    libc::AF_INET => {
+                        let sockaddr = unsafe { &*(ifaddr.ifa_addr as *const libc::sockaddr_in) };
+                        let addr = Ipv4Addr::from(u32::from_be(sockaddr.sin_addr.s_addr));
+                        addresses.insert(addr.to_string());
+                    }
+                    libc::AF_INET6 => {
+                        let sockaddr = unsafe { &*(ifaddr.ifa_addr as *const libc::sockaddr_in6) };
+                        let addr = Ipv6Addr::from(sockaddr.sin6_addr.s6_addr);
+                        addresses.insert(addr.to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        current = unsafe { (*current).ifa_next };
+    }
+
+    unsafe { libc::freeifaddrs(addrs) };
+    Ok(addresses.into_iter().collect())
 }
 
 fn now_rfc3339() -> AppResult<String> {

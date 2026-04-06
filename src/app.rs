@@ -146,6 +146,52 @@ max_restarts_per_hour = 3
         }
     }
 
+    #[test]
+    fn network_interface_status_returns_loopback() {
+        let app = App::new(policy_for_current_user(
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "__USER__"
+allowed_capabilities = ["read_basic"]
+
+[actions]
+allowed = ["network.interface_status"]
+denied = []
+"#,
+        ));
+
+        let request = Request {
+            version: 1,
+            request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62573".to_string(),
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Human,
+                id: "test-cli".to_string(),
+            },
+            action: "network.interface_status".to_string(),
+            params: serde_json::from_value(json!({
+                "interfaces": ["lo"]
+            }))
+            .expect("params"),
+            dry_run: false,
+            timeout_ms: 3000,
+        };
+
+        let response = app.handle_request(request, current_peer());
+        match response {
+            Response::Success(success) => {
+                let interfaces = success.result["interfaces"]
+                    .as_array()
+                    .expect("interfaces array");
+                assert_eq!(interfaces.len(), 1);
+                assert_eq!(interfaces[0]["name"], "lo");
+                assert!(interfaces[0]["state"].is_string());
+            }
+            Response::Error(error) => panic!("unexpected error response: {:?}", error),
+        }
+    }
+
     fn current_peer() -> PeerCredentials {
         PeerCredentials {
             uid: unsafe { libc::geteuid() },
