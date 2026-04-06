@@ -32,7 +32,7 @@ Dieses Dokument haelt die sicherheitsrelevanten Entscheidungen fuer die Nachhaer
 
 - Prioritaet: `P0`
 - GitHub-Issue: `#74`
-- Entscheidung: AdminBot fuehrt lokale Missbrauchsgrenzen fuer Verbindungen oder Request-Raten ein.
+- Entscheidung: AdminBot fuehrt eine kleine lokale Burst-Grenze von `8 Verbindungen pro 1000 ms` vor weiterer Request-Verarbeitung ein.
 - Begruendung: reine Eingabevalidierung reicht gegen Flooding nicht aus.
 - Nicht Ziel: globales verteiltes Rate-Limiting.
 

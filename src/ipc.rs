@@ -1,9 +1,11 @@
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use crate::app::App;
 use crate::error::{AppError, ErrorCode};
@@ -13,6 +15,8 @@ use crate::types::{Request, Response};
 pub const MAX_IPC_FRAME_SIZE: usize = 64 * 1024;
 pub const IPC_READ_TIMEOUT: Duration = Duration::from_secs(1);
 pub const IPC_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+pub const IPC_ADMISSION_WINDOW: Duration = Duration::from_secs(1);
+pub const IPC_MAX_CONNECTIONS_PER_WINDOW: usize = 8;
 
 #[derive(Debug)]
 enum ReadFrameError {
@@ -27,6 +31,7 @@ enum ReadFrameError {
 pub struct IpcServer {
     listener: UnixListener,
     socket_path: PathBuf,
+    admission_control: Mutex<AdmissionControl>,
 }
 
 impl IpcServer {
@@ -46,6 +51,10 @@ impl IpcServer {
         Ok(Self {
             listener,
             socket_path,
+            admission_control: Mutex::new(AdmissionControl::new(
+                IPC_MAX_CONNECTIONS_PER_WINDOW,
+                IPC_ADMISSION_WINDOW,
+            )),
         })
     }
 
@@ -53,7 +62,7 @@ impl IpcServer {
         for stream in self.listener.incoming() {
             match stream {
                 Ok(mut stream) => {
-                    self.process_connection(app, &mut stream)?;
+                    self.handle_connection(app, &mut stream)?;
                 }
                 Err(error) => {
                     eprintln!("adminbotd socket accept failed: {error}");
@@ -68,7 +77,7 @@ impl IpcServer {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn run_once(self, app: &App) -> io::Result<()> {
         let (mut stream, _) = self.listener.accept()?;
-        self.process_connection(app, &mut stream)
+        self.handle_connection(app, &mut stream)
     }
 
     fn handle_stream(&self, app: &App, stream: &mut UnixStream) -> Result<Response, AppError> {
@@ -116,6 +125,48 @@ impl IpcServer {
         })
     }
 
+    fn handle_connection(&self, app: &App, stream: &mut UnixStream) -> io::Result<()> {
+        if !self.try_admit_connection() {
+            return self.write_admission_rejection(stream);
+        }
+
+        self.process_connection(app, stream)
+    }
+
+    fn try_admit_connection(&self) -> bool {
+        let mut admission = self
+            .admission_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        admission.try_admit(Instant::now())
+    }
+
+    fn write_admission_rejection(&self, stream: &mut UnixStream) -> io::Result<()> {
+        let response = Response::error(
+            "00000000-0000-0000-0000-000000000000".to_string(),
+            AppError::new(
+                ErrorCode::RateLimited,
+                "IPC admission control rejected connection",
+            )
+            .with_detail(
+                "max_connections_per_window",
+                IPC_MAX_CONNECTIONS_PER_WINDOW as u64,
+            )
+            .with_detail(
+                "admission_window_ms",
+                IPC_ADMISSION_WINDOW.as_millis() as u64,
+            )
+            .retryable(true)
+            .to_body(),
+        );
+
+        configure_write_timeout(stream)?;
+        write_frame(stream, &response).map_err(|error| {
+            eprintln!("adminbotd admission rejection write failed: {error}");
+            error
+        })
+    }
+
     #[cfg(test)]
     fn bind_for_test(socket_path: PathBuf) -> io::Result<Self> {
         if let Some(parent) = socket_path.parent() {
@@ -132,7 +183,21 @@ impl IpcServer {
         Ok(Self {
             listener,
             socket_path,
+            admission_control: Mutex::new(AdmissionControl::new(
+                IPC_MAX_CONNECTIONS_PER_WINDOW,
+                IPC_ADMISSION_WINDOW,
+            )),
         })
+    }
+
+    #[cfg(test)]
+    fn run_n(self, app: &App, count: usize) -> io::Result<()> {
+        for _ in 0..count {
+            let (mut stream, _) = self.listener.accept()?;
+            self.handle_connection(app, &mut stream)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -223,6 +288,39 @@ impl ReadFrameError {
                 format!("IPC frame size {announced_size} exceeds maximum size {max_size}"),
             ),
         }
+    }
+}
+
+#[derive(Debug)]
+struct AdmissionControl {
+    max_connections: usize,
+    window: Duration,
+    accepted_at: VecDeque<Instant>,
+}
+
+impl AdmissionControl {
+    fn new(max_connections: usize, window: Duration) -> Self {
+        Self {
+            max_connections,
+            window,
+            accepted_at: VecDeque::new(),
+        }
+    }
+
+    fn try_admit(&mut self, now: Instant) -> bool {
+        while let Some(&accepted_at) = self.accepted_at.front() {
+            if now.duration_since(accepted_at) < self.window {
+                break;
+            }
+            self.accepted_at.pop_front();
+        }
+
+        if self.accepted_at.len() >= self.max_connections {
+            return false;
+        }
+
+        self.accepted_at.push_back(now);
+        true
     }
 }
 
@@ -543,6 +641,70 @@ mod tests {
         assert!(is_timeout_error(&error));
         assert!(elapsed >= IPC_WRITE_TIMEOUT);
         assert!(elapsed < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn admission_control_rejects_burst_above_window_limit() {
+        let now = Instant::now();
+        let mut control = AdmissionControl::new(2, Duration::from_secs(1));
+
+        assert!(control.try_admit(now));
+        assert!(control.try_admit(now + Duration::from_millis(100)));
+        assert!(!control.try_admit(now + Duration::from_millis(200)));
+        assert!(control.try_admit(now + Duration::from_millis(1100)));
+    }
+
+    #[test]
+    fn run_n_rate_limits_flooded_connections() {
+        let socket_path = temp_socket_path("flood");
+        let policy_path = temp_policy_path();
+        let policy = PolicyEngine::load_from_path(policy_path.clone()).expect("policy");
+        let app = App::new(policy);
+        let server = IpcServer::bind_for_test(socket_path.clone()).expect("bind");
+        let connection_count = IPC_MAX_CONNECTIONS_PER_WINDOW + 2;
+
+        let handle = thread::spawn(move || server.run_n(&app, connection_count));
+
+        let mut ok_count = 0;
+        let mut rate_limited_count = 0;
+
+        for idx in 0..connection_count {
+            let mut client = connect_with_retry(&socket_path);
+            if idx < IPC_MAX_CONNECTIONS_PER_WINDOW {
+                let request = serde_json::json!({
+                    "version": 1,
+                    "request_id": format!("2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a6259{idx}"),
+                    "requested_by": {
+                        "type": "human",
+                        "id": "ipc-test"
+                    },
+                    "action": "system.status",
+                    "params": {},
+                    "dry_run": false,
+                    "timeout_ms": 3000
+                });
+                let payload = serde_json::to_vec(&request).expect("encode request");
+                write_raw_frame(&mut client, &payload);
+            }
+
+            let response_payload = read_frame(&mut client).expect("read response");
+            let response: serde_json::Value =
+                serde_json::from_slice(&response_payload).expect("decode response");
+
+            match response["status"].as_str() {
+                Some("ok") => ok_count += 1,
+                Some("error") if response["error"]["code"] == "rate_limited" => {
+                    rate_limited_count += 1;
+                }
+                other => panic!("unexpected response status: {other:?}"),
+            }
+        }
+
+        assert_eq!(ok_count, IPC_MAX_CONNECTIONS_PER_WINDOW);
+        assert_eq!(rate_limited_count, 2);
+
+        handle.join().expect("join").expect("server run_n");
+        let _ = fs::remove_file(policy_path);
     }
 
     fn temp_socket_path(name: &str) -> PathBuf {
