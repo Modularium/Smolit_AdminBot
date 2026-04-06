@@ -2,6 +2,7 @@ use std::ffi::CString;
 
 use libc::iovec;
 use serde_json::json;
+use serde_json::Value;
 
 use crate::error::AppError;
 use crate::peer::PeerCredentials;
@@ -84,6 +85,7 @@ impl AuditLogger {
 }
 
 fn build_journald_fields(event: &AuditEvent<'_>) -> Vec<CString> {
+    let access = access_decisions(event);
     let mut fields = vec![
         cstring_field("MESSAGE", &format_message(event)),
         cstring_field("PRIORITY", priority_value(event)),
@@ -102,6 +104,8 @@ fn build_journald_fields(event: &AuditEvent<'_>) -> Vec<CString> {
         cstring_field("ADMINBOT_PEER_PID", &event.peer.pid.to_string()),
         cstring_field("ADMINBOT_DRY_RUN", bool_value(event.request.dry_run)),
         cstring_field("ADMINBOT_DECISION", decision_value(event.decision)),
+        cstring_field("ADMINBOT_POLICY_DECISION", access.policy),
+        cstring_field("ADMINBOT_CAPABILITY_DECISION", access.capability),
         cstring_field("ADMINBOT_RESULT", event.result),
     ];
 
@@ -111,6 +115,17 @@ fn build_journald_fields(event: &AuditEvent<'_>) -> Vec<CString> {
             &error.code.to_string(),
         ));
         fields.push(cstring_field("ADMINBOT_ERROR_MESSAGE", &error.message));
+
+        if let Some(policy_section) = string_detail(error, "policy_section") {
+            fields.push(cstring_field("ADMINBOT_POLICY_SECTION", policy_section));
+        }
+
+        if let Some(required_capability) = string_detail(error, "required_capability") {
+            fields.push(cstring_field(
+                "ADMINBOT_REQUIRED_CAPABILITY",
+                required_capability,
+            ));
+        }
     }
 
     fields
@@ -133,6 +148,7 @@ fn send_to_journald(fields: &[CString]) -> Result<(), ()> {
 }
 
 fn fallback_json(event: &AuditEvent<'_>) -> serde_json::Value {
+    let access = access_decisions(event);
     let mut entry = json!({
         "request_id": event.request.request_id,
         "action": event.request.action,
@@ -148,6 +164,12 @@ fn fallback_json(event: &AuditEvent<'_>) -> serde_json::Value {
         },
         "dry_run": event.request.dry_run,
         "decision": decision_value(event.decision),
+        "policy": {
+            "decision": access.policy
+        },
+        "capability": {
+            "decision": access.capability
+        },
         "result": event.result
     });
 
@@ -156,6 +178,14 @@ fn fallback_json(event: &AuditEvent<'_>) -> serde_json::Value {
             "code": error.code,
             "message": error.message,
         });
+
+        if let Some(policy_section) = string_detail(error, "policy_section") {
+            entry["policy"]["section"] = json!(policy_section);
+        }
+
+        if let Some(required_capability) = string_detail(error, "required_capability") {
+            entry["capability"]["required"] = json!(required_capability);
+        }
     }
 
     entry
@@ -231,6 +261,52 @@ fn bool_value(value: bool) -> &'static str {
     }
 }
 
+struct AccessDecisions {
+    policy: &'static str,
+    capability: &'static str,
+}
+
+fn access_decisions(event: &AuditEvent<'_>) -> AccessDecisions {
+    match event.stage {
+        AuditStage::Received => AccessDecisions {
+            policy: "pending",
+            capability: "pending",
+        },
+        AuditStage::Completed => match event.error.map(|error| error.code) {
+            None => AccessDecisions {
+                policy: "allow",
+                capability: "allow",
+            },
+            Some(crate::error::ErrorCode::PolicyDenied) => AccessDecisions {
+                policy: "deny",
+                capability: "not_evaluated",
+            },
+            Some(crate::error::ErrorCode::CapabilityDenied) => AccessDecisions {
+                policy: "allow",
+                capability: "deny",
+            },
+            Some(crate::error::ErrorCode::Unauthorized)
+            | Some(crate::error::ErrorCode::Forbidden)
+            | Some(crate::error::ErrorCode::ValidationError)
+            | Some(crate::error::ErrorCode::UnsupportedVersion) => AccessDecisions {
+                policy: "not_evaluated",
+                capability: "not_evaluated",
+            },
+            Some(_) => AccessDecisions {
+                policy: "allow",
+                capability: "allow",
+            },
+        },
+    }
+}
+
+fn string_detail<'a>(error: &'a AppError, key: &str) -> Option<&'a str> {
+    match error.details.get(key) {
+        Some(Value::String(value)) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -262,6 +338,8 @@ mod tests {
         assert!(fields.contains(&"ADMINBOT_STAGE=completed".to_string()));
         assert!(fields.contains(&"ADMINBOT_DRY_RUN=false".to_string()));
         assert!(fields.contains(&"ADMINBOT_DECISION=allow".to_string()));
+        assert!(fields.contains(&"ADMINBOT_POLICY_DECISION=allow".to_string()));
+        assert!(fields.contains(&"ADMINBOT_CAPABILITY_DECISION=allow".to_string()));
         assert!(fields.contains(&"ADMINBOT_RESULT=ok".to_string()));
     }
 
@@ -285,6 +363,8 @@ mod tests {
 
         assert!(fields.contains(&"ADMINBOT_STAGE=received".to_string()));
         assert!(fields.contains(&"ADMINBOT_DECISION=pending".to_string()));
+        assert!(fields.contains(&"ADMINBOT_POLICY_DECISION=pending".to_string()));
+        assert!(fields.contains(&"ADMINBOT_CAPABILITY_DECISION=pending".to_string()));
         assert!(fields.contains(&"ADMINBOT_RESULT=received".to_string()));
     }
 
@@ -309,8 +389,60 @@ mod tests {
 
         assert!(fields.contains(&"PRIORITY=4".to_string()));
         assert!(fields.contains(&"ADMINBOT_DECISION=deny".to_string()));
+        assert!(fields.contains(&"ADMINBOT_POLICY_DECISION=deny".to_string()));
+        assert!(fields.contains(&"ADMINBOT_CAPABILITY_DECISION=not_evaluated".to_string()));
         assert!(fields.contains(&"ADMINBOT_ERROR_CODE=policy_denied".to_string()));
         assert!(fields.contains(&"ADMINBOT_ERROR_MESSAGE=action denied".to_string()));
+    }
+
+    #[test]
+    fn build_journald_fields_includes_capability_decision_context() {
+        let request = test_request();
+        let peer = test_peer();
+        let error = AppError::new(ErrorCode::CapabilityDenied, "required capability missing")
+            .with_detail("required_capability", "service_control");
+        let event = AuditEvent {
+            request: &request,
+            peer: &peer,
+            stage: AuditStage::Completed,
+            decision: AuditDecision::Deny,
+            result: "error",
+            error: Some(&error),
+        };
+
+        let fields = build_journald_fields(&event)
+            .into_iter()
+            .map(|field| field.into_string().expect("utf8"))
+            .collect::<Vec<_>>();
+
+        assert!(fields.contains(&"ADMINBOT_POLICY_DECISION=allow".to_string()));
+        assert!(fields.contains(&"ADMINBOT_CAPABILITY_DECISION=deny".to_string()));
+        assert!(fields.contains(&"ADMINBOT_REQUIRED_CAPABILITY=service_control".to_string()));
+    }
+
+    #[test]
+    fn build_journald_fields_includes_policy_section_for_policy_denial() {
+        let request = test_request();
+        let peer = test_peer();
+        let error = AppError::new(ErrorCode::PolicyDenied, "mount not allowed by policy")
+            .with_detail("policy_section", "filesystem.allowed_mounts")
+            .with_detail("mount", "/secret");
+        let event = AuditEvent {
+            request: &request,
+            peer: &peer,
+            stage: AuditStage::Completed,
+            decision: AuditDecision::Deny,
+            result: "error",
+            error: Some(&error),
+        };
+
+        let fields = build_journald_fields(&event)
+            .into_iter()
+            .map(|field| field.into_string().expect("utf8"))
+            .collect::<Vec<_>>();
+
+        assert!(fields.contains(&"ADMINBOT_POLICY_SECTION=filesystem.allowed_mounts".to_string()));
+        assert!(!fields.iter().any(|field| field.contains("/secret")));
     }
 
     #[test]
@@ -341,6 +473,8 @@ mod tests {
         assert_eq!(json["stage"], "completed");
         assert_eq!(json["dry_run"], false);
         assert_eq!(json["decision"], "deny");
+        assert_eq!(json["policy"]["decision"], "allow");
+        assert_eq!(json["capability"]["decision"], "allow");
         assert_eq!(json["result"], "error");
         assert_eq!(json["error"]["code"], "execution_failed");
         assert_eq!(json["error"]["message"], "write failed");
