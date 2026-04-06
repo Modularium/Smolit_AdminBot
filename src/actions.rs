@@ -1043,6 +1043,121 @@ mod tests {
         assert_eq!(error.details.get("action"), Some(&json!("unknown.action")));
     }
 
+    #[test]
+    fn validate_request_shape_rejects_unsupported_version() {
+        let app = App::new(policy_for_current_user());
+        let request = Request {
+            version: 2,
+            request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62572".to_string(),
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Human,
+                id: "validator-test".to_string(),
+            },
+            action: "system.status".to_string(),
+            params: serde_json::from_value(json!({})).expect("params"),
+            dry_run: false,
+            timeout_ms: 3000,
+        };
+
+        let error = validate_request_shape(&request, &app).expect_err("unsupported version");
+        assert_eq!(error.code, ErrorCode::UnsupportedVersion);
+        assert_eq!(error.message, "unsupported protocol version");
+        assert_eq!(error.details.get("version"), Some(&json!(2)));
+    }
+
+    #[test]
+    fn validate_request_shape_rejects_timeout_out_of_range() {
+        let app = App::new(policy_for_current_user());
+        let request = Request {
+            version: 1,
+            request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62573".to_string(),
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Human,
+                id: "validator-test".to_string(),
+            },
+            action: "system.status".to_string(),
+            params: serde_json::from_value(json!({})).expect("params"),
+            dry_run: false,
+            timeout_ms: 30_001,
+        };
+
+        let error = validate_request_shape(&request, &app).expect_err("timeout out of range");
+        assert_eq!(error.code, ErrorCode::ValidationError);
+        assert_eq!(error.message, "timeout_ms is out of allowed range");
+        assert_eq!(error.details.get("timeout_ms"), Some(&json!(30_001)));
+    }
+
+    #[test]
+    fn validate_request_shape_rejects_unknown_param_fields() {
+        let app = App::new(policy_for_current_user());
+        let request = Request {
+            version: 1,
+            request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62574".to_string(),
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Human,
+                id: "validator-test".to_string(),
+            },
+            action: "system.status".to_string(),
+            params: serde_json::from_value(json!({"unexpected": true})).expect("params"),
+            dry_run: false,
+            timeout_ms: 3000,
+        };
+
+        let error = validate_request_shape(&request, &app).expect_err("unknown field");
+        assert_eq!(error.code, ErrorCode::ValidationError);
+        assert_eq!(error.message, "invalid action params");
+    }
+
+    #[test]
+    fn validate_request_shape_rejects_invalid_enum_values() {
+        let app = App::new(policy_for_current_user());
+        let request = Request {
+            version: 1,
+            request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62575".to_string(),
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Human,
+                id: "validator-test".to_string(),
+            },
+            action: "service.restart".to_string(),
+            params: serde_json::from_value(json!({
+                "unit": "nginx.service",
+                "mode": "unsafe",
+                "reason": "test"
+            }))
+            .expect("params"),
+            dry_run: false,
+            timeout_ms: 3000,
+        };
+
+        let error = validate_request_shape(&request, &app).expect_err("invalid enum");
+        assert_eq!(error.code, ErrorCode::ValidationError);
+        assert_eq!(error.message, "invalid action params");
+    }
+
+    #[test]
+    fn validate_request_shape_rejects_limit_violations_before_execution() {
+        let app = App::new(policy_for_current_user());
+        let request = Request {
+            version: 1,
+            request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62576".to_string(),
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Human,
+                id: "validator-test".to_string(),
+            },
+            action: "disk.usage".to_string(),
+            params: serde_json::from_value(json!({"mounts": []})).expect("params"),
+            dry_run: false,
+            timeout_ms: 3000,
+        };
+
+        let error = validate_request_shape(&request, &app).expect_err("limit violation");
+        assert_eq!(error.code, ErrorCode::ValidationError);
+        assert_eq!(
+            error.message,
+            "mounts must contain between 1 and 16 entries"
+        );
+    }
+
     fn policy_for_current_user() -> PolicyEngine {
         let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
         let content = format!(
