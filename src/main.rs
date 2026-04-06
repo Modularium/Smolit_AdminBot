@@ -5,6 +5,7 @@ mod error;
 mod ipc;
 mod peer;
 mod policy;
+mod systemd;
 mod types;
 
 use std::path::PathBuf;
