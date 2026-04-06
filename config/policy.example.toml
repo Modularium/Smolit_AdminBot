@@ -30,6 +30,8 @@ restart_cooldown_seconds = 300
 max_restarts_per_hour = 3
 
 [constraints]
+# Optional hardening profile:
+# security_profile = "high_security"
 default_timeout_ms = 3000
 max_timeout_ms = 30000
 journal_limit_max = 200
@@ -41,3 +43,4 @@ global_read_requests_per_window = 120
 mutate_rate_limit_window_ms = 60000
 mutate_requests_per_peer_per_window = 4
 global_mutate_requests_per_window = 12
+replay_window_ms = 300000
