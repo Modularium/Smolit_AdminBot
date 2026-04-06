@@ -282,6 +282,58 @@ denied = []
     }
 
     #[test]
+    fn journal_query_denies_unit_not_allowed_by_policy() {
+        let app = App::new(policy_for_current_user(
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "__USER__"
+allowed_capabilities = ["read_sensitive"]
+
+[actions]
+allowed = ["journal.query"]
+denied = []
+
+[service_control]
+allowed_units = ["nginx.service"]
+"#,
+        ));
+
+        let request = Request {
+            version: 1,
+            request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62575".to_string(),
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Human,
+                id: "test-cli".to_string(),
+            },
+            action: "journal.query".to_string(),
+            params: serde_json::from_value(json!({
+                "unit": "sshd.service",
+                "limit": 10
+            }))
+            .expect("params"),
+            dry_run: false,
+            timeout_ms: 3000,
+        };
+
+        let response = app.handle_request(request, current_peer());
+        match response {
+            Response::Error(error) => {
+                assert_eq!(
+                    serde_json::to_value(error.error.code).unwrap(),
+                    json!("policy_denied")
+                );
+                assert_eq!(
+                    error.error.details.get("policy_section"),
+                    Some(&json!("service_control.allowed_units"))
+                );
+            }
+            Response::Success(success) => panic!("unexpected success response: {:?}", success),
+        }
+    }
+
+    #[test]
     fn system_health_returns_expected_check_set() {
         let app = App::new(policy_for_current_user(
             r#"

@@ -228,12 +228,7 @@ impl PolicyEngine {
     }
 
     pub fn check_service_restart_allowed(&self, unit: &str) -> AppResult<()> {
-        if !self.snapshot.service_allowed_units.contains(unit) {
-            return Err(
-                AppError::new(ErrorCode::PolicyDenied, "unit not allowed by policy")
-                    .with_detail("unit", unit.to_string()),
-            );
-        }
+        self.check_service_unit_allowed(unit)?;
 
         let now = SystemTime::now();
         let mut guard = self.cooldowns.lock().expect("cooldown lock poisoned");
@@ -265,6 +260,19 @@ impl PolicyEngine {
             return Err(
                 AppError::new(ErrorCode::RateLimited, "restart rate limit exceeded")
                     .with_detail("unit", unit.to_string()),
+            );
+        }
+
+        Ok(())
+    }
+
+    pub fn check_service_unit_allowed(&self, unit: &str) -> AppResult<()> {
+        if !self.snapshot.service_allowed_units.contains(unit) {
+            return Err(
+                AppError::new(ErrorCode::PolicyDenied, "unit not allowed by policy")
+                    .with_detail("field", "params.unit")
+                    .with_detail("unit", unit.to_string())
+                    .with_detail("policy_section", "service_control.allowed_units"),
             );
         }
 
