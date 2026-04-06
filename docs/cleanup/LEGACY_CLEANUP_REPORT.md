@@ -98,3 +98,40 @@ Das Repository bildet jetzt im Wesentlichen nur noch folgende kanonische Bereich
 - Security Release Gate
 
 Offen bleiben nur bewusst nicht angefasste lokale/untracked Dokumente sowie die kleinen aktuellen IPC-Testhilfen.
+
+## 6. Finaler Merge- und Restpruefungsstatus
+
+- PR `#112` `chore(cleanup): remove legacy python and outdated artifacts` wurde nach Cleanup-Gate-Pruefung per Squash nach `dev` gemerged.
+- `dev` wurde danach auf den Merge-Stand aktualisiert und erneut gegen das lokale Qualitaetsgate geprueft:
+  - `cargo fmt --all`
+  - `cargo build`
+  - `cargo test`
+  - `bash scripts/verify_security_release_gate.sh --mode artifact`
+
+Ergebnis der finalen Legacy-Restpruefung:
+
+- getrackte Python-Dateien (`*.py`): keine
+- alte Service-/Deployment-Artefakte des Python-/Legacy-Modells: keine
+- alte Docker-/Compose-/ELK-/Prometheus-/AppArmor-/requirements-Artefakte: keine
+
+Verbliebene Treffer wurden wie folgt klassifiziert:
+
+- `README.md`
+  - unkritische Legacy-Referenz in der Scope-Beschreibung
+  - beschreibt nur, dass der fruehere Bestand nicht mehr Teil des Repositories ist
+- `docs/cleanup/LEGACY_CLEANUP_PLAN.md`
+  - dokumentierte Legacy-Referenzen
+  - bewusst enthalten, um die Cleanup-Entscheidungen nachvollziehbar zu machen
+- `docs/cleanup/LEGACY_CLEANUP_REPORT.md`
+  - dokumentierte Legacy-Referenzen
+  - bewusst enthalten, um den Cleanup nachvollziehbar zu machen
+- `docs/adminbot_v2/ARCHITECTURE.md`, `docs/adminbot_v2/DECISIONS.md`, `docs/adminbot_v2/ACTION_REGISTRY.md`
+  - unkritische Referenzen auf verworfene Altideen oder ausgeschlossene Betriebsmodelle
+  - keine verbliebenen Implementierungsartefakte
+- `scripts/send_request.sh`
+  - nutzt ein kleines `python3`-Inline-Snippet fuer das Framing des aktuellen v2-IPC-Protokolls
+  - kein alter Python-/Legacy-AdminBot-Code, sondern bewusst behaltene Testhilfe
+
+Klare Aussage:
+
+Das getrackte Repository ist frei von altem Python-/Legacy-AdminBot-Code. Verblieben sind nur bewusst dokumentierte historische Referenzen sowie ein aktuelles IPC-Testhilfsskript mit kleinem `python3`-Framing-Helfer.
