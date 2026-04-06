@@ -4,11 +4,13 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use libc::iovec;
+use sha2::{Digest, Sha256};
 use serde_json::json;
 use serde_json::Value;
 
 use crate::error::AppError;
 use crate::peer::PeerCredentials;
+use crate::policy::ObservabilityConfig;
 use crate::types::Request;
 
 pub const AUDIT_REPETITIVE_ERROR_WINDOW: Duration = Duration::from_secs(1);
@@ -16,6 +18,7 @@ pub const AUDIT_REPETITIVE_ERROR_BURST_LIMIT: usize = 4;
 
 #[derive(Debug)]
 pub struct AuditLogger {
+    config: ObservabilityConfig,
     flood_control: Mutex<AuditFloodControl>,
 }
 
@@ -75,13 +78,20 @@ unsafe extern "C" {
 
 impl Default for AuditLogger {
     fn default() -> Self {
-        Self {
-            flood_control: Mutex::new(AuditFloodControl::default()),
-        }
+        Self::new(ObservabilityConfig {
+            hash_requested_by_id: false,
+        })
     }
 }
 
 impl AuditLogger {
+    pub fn new(config: ObservabilityConfig) -> Self {
+        Self {
+            config,
+            flood_control: Mutex::new(AuditFloodControl::default()),
+        }
+    }
+
     pub fn log_received(&self, request: &Request, peer: &PeerCredentials) {
         let event = AuditEvent {
             request,
@@ -125,9 +135,9 @@ impl AuditLogger {
             AuditEmission::Suppress => return,
         };
 
-        let fields = build_journald_fields(event, suppression_notice);
+        let fields = build_journald_fields(event, &self.config, suppression_notice);
         if send_to_journald(&fields).is_err() {
-            eprintln!("{}", fallback_json(event, suppression_notice));
+            eprintln!("{}", fallback_json(event, &self.config, suppression_notice));
         }
     }
 
@@ -176,7 +186,11 @@ impl AuditLogger {
     }
 }
 
-fn build_journald_fields(event: &AuditEvent<'_>, suppression_notice: bool) -> Vec<CString> {
+fn build_journald_fields(
+    event: &AuditEvent<'_>,
+    config: &ObservabilityConfig,
+    suppression_notice: bool,
+) -> Vec<CString> {
     let access = access_decisions(event);
     let mut fields = vec![
         cstring_field("MESSAGE", &format_message(event)),
@@ -190,7 +204,6 @@ fn build_journald_fields(event: &AuditEvent<'_>, suppression_notice: bool) -> Ve
             "ADMINBOT_REQUESTED_BY_TYPE",
             requested_by_type(event.request),
         ),
-        cstring_field("ADMINBOT_REQUESTED_BY_ID", &event.request.requested_by.id),
         cstring_field("ADMINBOT_PEER_UID", &event.peer.uid.to_string()),
         cstring_field("ADMINBOT_PEER_GID", &event.peer.gid.to_string()),
         cstring_field("ADMINBOT_PEER_PID", &event.peer.pid.to_string()),
@@ -200,6 +213,19 @@ fn build_journald_fields(event: &AuditEvent<'_>, suppression_notice: bool) -> Ve
         cstring_field("ADMINBOT_CAPABILITY_DECISION", access.capability),
         cstring_field("ADMINBOT_RESULT", event.result),
     ];
+
+    if config.hash_requested_by_id {
+        fields.push(cstring_field(
+            "ADMINBOT_REQUESTED_BY_ID_HASH",
+            &hash_string(&event.request.requested_by.id),
+        ));
+        fields.push(cstring_field("ADMINBOT_REQUESTED_BY_ID_REDACTED", "true"));
+    } else {
+        fields.push(cstring_field(
+            "ADMINBOT_REQUESTED_BY_ID",
+            &event.request.requested_by.id,
+        ));
+    }
 
     if suppression_notice {
         fields.push(cstring_field("ADMINBOT_AUDIT_SUPPRESSION_ACTIVE", "true"));
@@ -251,15 +277,18 @@ fn send_to_journald(fields: &[CString]) -> Result<(), ()> {
     Ok(())
 }
 
-fn fallback_json(event: &AuditEvent<'_>, suppression_notice: bool) -> serde_json::Value {
+fn fallback_json(
+    event: &AuditEvent<'_>,
+    config: &ObservabilityConfig,
+    suppression_notice: bool,
+) -> serde_json::Value {
     let access = access_decisions(event);
     let mut entry = json!({
         "request_id": event.request.request_id,
         "action": event.request.action,
         "stage": stage_value(event.stage),
         "requested_by": {
-            "type": event.request.requested_by.origin_type,
-            "id": event.request.requested_by.id
+            "type": event.request.requested_by.origin_type
         },
         "peer": {
             "uid": event.peer.uid,
@@ -276,6 +305,13 @@ fn fallback_json(event: &AuditEvent<'_>, suppression_notice: bool) -> serde_json
         },
         "result": event.result
     });
+
+    if config.hash_requested_by_id {
+        entry["requested_by"]["id_hash"] = json!(hash_string(&event.request.requested_by.id));
+        entry["requested_by"]["id_redacted"] = json!(true);
+    } else {
+        entry["requested_by"]["id"] = json!(event.request.requested_by.id);
+    }
 
     if suppression_notice {
         entry["audit"] = json!({
@@ -442,6 +478,10 @@ fn string_detail<'a>(error: &'a AppError, key: &str) -> Option<&'a str> {
     }
 }
 
+fn hash_string(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,7 +501,7 @@ mod tests {
             error: None,
         };
 
-        let fields = build_journald_fields(&event, false)
+        let fields = build_journald_fields(&event, &default_observability(), false)
             .into_iter()
             .map(|field| field.into_string().expect("utf8"))
             .collect::<Vec<_>>();
@@ -491,7 +531,7 @@ mod tests {
             error: None,
         };
 
-        let fields = build_journald_fields(&event, false)
+        let fields = build_journald_fields(&event, &default_observability(), false)
             .into_iter()
             .map(|field| field.into_string().expect("utf8"))
             .collect::<Vec<_>>();
@@ -517,7 +557,7 @@ mod tests {
             error: Some(&error),
         };
 
-        let fields = build_journald_fields(&event, false)
+        let fields = build_journald_fields(&event, &default_observability(), false)
             .into_iter()
             .map(|field| field.into_string().expect("utf8"))
             .collect::<Vec<_>>();
@@ -545,7 +585,7 @@ mod tests {
             error: Some(&error),
         };
 
-        let fields = build_journald_fields(&event, false)
+        let fields = build_journald_fields(&event, &default_observability(), false)
             .into_iter()
             .map(|field| field.into_string().expect("utf8"))
             .collect::<Vec<_>>();
@@ -571,7 +611,7 @@ mod tests {
             error: Some(&error),
         };
 
-        let fields = build_journald_fields(&event, false)
+        let fields = build_journald_fields(&event, &default_observability(), false)
             .into_iter()
             .map(|field| field.into_string().expect("utf8"))
             .collect::<Vec<_>>();
@@ -602,7 +642,7 @@ mod tests {
             error: Some(&error),
         };
 
-        let json = fallback_json(&event, false);
+        let json = fallback_json(&event, &default_observability(), false);
         assert_eq!(json["request_id"], "test-request-id");
         assert_eq!(json["action"], "system.status");
         assert_eq!(json["stage"], "completed");
@@ -730,7 +770,7 @@ mod tests {
             error: Some(&error),
         };
 
-        let json = fallback_json(&event, true);
+        let json = fallback_json(&event, &default_observability(), true);
         assert_eq!(json["audit"]["suppression_active"], true);
         assert_eq!(
             json["audit"]["suppression_burst_limit"],
@@ -740,6 +780,39 @@ mod tests {
             json["audit"]["suppression_window_ms"],
             json!(AUDIT_REPETITIVE_ERROR_WINDOW.as_millis())
         );
+    }
+
+    #[test]
+    fn hashed_requested_by_id_redacts_cleartext_in_audit_output() {
+        let request = test_request();
+        let peer = test_peer();
+        let event = AuditEvent {
+            request: &request,
+            peer: &peer,
+            stage: AuditStage::Completed,
+            decision: AuditDecision::Allow,
+            result: "ok",
+            error: None,
+        };
+        let config = ObservabilityConfig {
+            hash_requested_by_id: true,
+        };
+
+        let fields = build_journald_fields(&event, &config, false)
+            .into_iter()
+            .map(|field| field.into_string().expect("utf8"))
+            .collect::<Vec<_>>();
+        assert!(!fields.iter().any(|field| field == "ADMINBOT_REQUESTED_BY_ID=local-cli"));
+        assert!(fields
+            .iter()
+            .any(|field| field.starts_with("ADMINBOT_REQUESTED_BY_ID_HASH=")));
+        assert!(fields.contains(&"ADMINBOT_REQUESTED_BY_ID_REDACTED=true".to_string()));
+
+        let json = fallback_json(&event, &config, false);
+        assert_eq!(json["requested_by"]["type"], "human");
+        assert_eq!(json["requested_by"]["id_redacted"], true);
+        assert!(json["requested_by"]["id"].is_null());
+        assert!(json["requested_by"]["id_hash"].as_str().is_some());
     }
 
     fn test_request() -> Request {
@@ -764,6 +837,12 @@ mod tests {
             pid: 4242,
             supplementary_gids: Vec::new(),
             unix_user: Some("tester".to_string()),
+        }
+    }
+
+    fn default_observability() -> ObservabilityConfig {
+        ObservabilityConfig {
+            hash_requested_by_id: false,
         }
     }
 }
