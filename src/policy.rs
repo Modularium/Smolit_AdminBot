@@ -1,11 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::actions::ActionMetadata;
 use crate::error::{AppError, AppResult, ErrorCode};
@@ -14,6 +16,10 @@ use crate::types::{Request, RequestOriginType};
 
 pub const EXPECTED_POLICY_OWNER_UID: u32 = 0;
 pub const POLICY_FORBIDDEN_MODE_BITS: u32 = 0o022;
+#[cfg(not(test))]
+pub const DEFAULT_RESTART_STATE_PATH: &str = "/var/lib/adminbot/restart_abuse_state.json";
+pub const RESTART_STATE_FORBIDDEN_MODE_BITS: u32 = 0o077;
+pub const RESTART_STATE_MODE: u32 = 0o600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -133,10 +139,31 @@ struct CooldownTracker {
     recent_restarts: HashMap<String, Vec<SystemTime>>,
 }
 
+#[derive(Debug, Default)]
+struct RestartGuardState {
+    tracker: CooldownTracker,
+    persistence_error: Option<AppError>,
+}
+
+#[derive(Debug)]
+struct RestartStateStore {
+    path: PathBuf,
+    expected_owner_uid: u32,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct PersistedCooldownTracker {
+    #[serde(default)]
+    last_restart: HashMap<String, u64>,
+    #[serde(default)]
+    recent_restarts: HashMap<String, Vec<u64>>,
+}
+
 #[derive(Debug)]
 pub struct PolicyEngine {
     snapshot: PolicySnapshot,
-    cooldowns: Mutex<CooldownTracker>,
+    cooldowns: Mutex<RestartGuardState>,
+    restart_state_store: RestartStateStore,
 }
 
 impl PolicyEngine {
@@ -145,6 +172,13 @@ impl PolicyEngine {
     }
 
     pub fn load_from_path(path: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::load_from_paths(path.clone(), default_restart_state_path_for_policy(&path))
+    }
+
+    fn load_from_paths(
+        path: PathBuf,
+        restart_state_path: PathBuf,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let content = fs::read_to_string(path)?;
         let parsed: PolicyFile = toml::from_str(&content)?;
         if parsed.version != 1 {
@@ -186,6 +220,9 @@ impl PolicyEngine {
             process_limit_max: parsed.constraints.process_limit_max.unwrap_or(50),
             max_parallel_mutations: parsed.constraints.max_parallel_mutations.unwrap_or(1),
         };
+        let restart_state_store =
+            RestartStateStore::new(restart_state_path, current_effective_uid());
+        let tracker = restart_state_store.load_or_initialize()?;
 
         Ok(Self {
             snapshot: PolicySnapshot {
@@ -201,7 +238,11 @@ impl PolicyEngine {
                 constraints,
                 clients,
             },
-            cooldowns: Mutex::new(CooldownTracker::default()),
+            cooldowns: Mutex::new(RestartGuardState {
+                tracker,
+                persistence_error: None,
+            }),
+            restart_state_store,
         })
     }
 
@@ -249,7 +290,11 @@ impl PolicyEngine {
 
         let now = SystemTime::now();
         let mut guard = self.cooldowns.lock().expect("cooldown lock poisoned");
-        let tracker = &mut *guard;
+        if let Some(error) = &guard.persistence_error {
+            return Err(error.clone());
+        }
+        let tracker = &mut guard.tracker;
+        tracker.retain_recent_restarts(now);
 
         if let Some(last_restart) = tracker.last_restart.get(unit) {
             if now
@@ -312,12 +357,27 @@ impl PolicyEngine {
     pub fn record_service_restart(&self, unit: &str) {
         let now = SystemTime::now();
         let mut guard = self.cooldowns.lock().expect("cooldown lock poisoned");
-        guard.last_restart.insert(unit.to_string(), now);
+        guard.tracker.last_restart.insert(unit.to_string(), now);
+        guard.tracker.retain_recent_restarts(now);
         guard
+            .tracker
             .recent_restarts
             .entry(unit.to_string())
             .or_default()
             .push(now);
+        match self.restart_state_store.persist(&guard.tracker) {
+            Ok(()) => guard.persistence_error = None,
+            Err(error) => {
+                guard.persistence_error = Some(
+                    AppError::new(
+                        ErrorCode::PreconditionFailed,
+                        "restart abuse state persistence is unavailable",
+                    )
+                    .with_detail("path", self.restart_state_store.path.display().to_string())
+                    .with_detail("source", error.to_string()),
+                )
+            }
+        }
     }
 
     fn capabilities_for_request_peer(
@@ -363,6 +423,286 @@ impl PolicyEngine {
 
         Ok(capabilities)
     }
+}
+
+impl CooldownTracker {
+    fn retain_recent_restarts(&mut self, now: SystemTime) {
+        self.recent_restarts.retain(|_, entries| {
+            entries.retain(|timestamp| {
+                now.duration_since(*timestamp)
+                    .unwrap_or(Duration::from_secs(0))
+                    .as_secs()
+                    < 3600
+            });
+            !entries.is_empty()
+        });
+        self.last_restart.retain(|_, timestamp| {
+            now.duration_since(*timestamp)
+                .unwrap_or(Duration::from_secs(0))
+                .as_secs()
+                < 3600
+        });
+    }
+}
+
+impl RestartStateStore {
+    fn new(path: PathBuf, expected_owner_uid: u32) -> Self {
+        Self {
+            path,
+            expected_owner_uid,
+        }
+    }
+
+    fn load_or_initialize(&self) -> AppResult<CooldownTracker> {
+        self.validate_parent_directory()?;
+        if !self.path.exists() {
+            let tracker = CooldownTracker::default();
+            self.persist(&tracker)?;
+            return Ok(tracker);
+        }
+
+        self.validate_existing_file()?;
+        let content = fs::read_to_string(&self.path).map_err(|error| {
+            AppError::new(
+                ErrorCode::PreconditionFailed,
+                "restart abuse state file is unreadable",
+            )
+            .with_detail("path", self.path.display().to_string())
+            .with_detail("source", error.to_string())
+        })?;
+        let persisted: PersistedCooldownTracker =
+            serde_json::from_str(&content).map_err(|error| {
+                AppError::new(
+                    ErrorCode::PreconditionFailed,
+                    "restart abuse state file is invalid",
+                )
+                .with_detail("path", self.path.display().to_string())
+                .with_detail("source", error.to_string())
+            })?;
+        let now = SystemTime::now();
+        let mut tracker = persisted.into_tracker();
+        tracker.retain_recent_restarts(now);
+        self.persist(&tracker)?;
+        Ok(tracker)
+    }
+
+    fn persist(&self, tracker: &CooldownTracker) -> AppResult<()> {
+        self.validate_parent_directory()?;
+        let now = SystemTime::now();
+        let mut snapshot = CooldownTracker {
+            last_restart: tracker.last_restart.clone(),
+            recent_restarts: tracker.recent_restarts.clone(),
+        };
+        snapshot.retain_recent_restarts(now);
+        let persisted = PersistedCooldownTracker::from_tracker(&snapshot)?;
+        let serialized = serde_json::to_vec_pretty(&persisted).map_err(|error| {
+            AppError::new(
+                ErrorCode::PreconditionFailed,
+                "restart abuse state could not be serialized",
+            )
+            .with_detail("path", self.path.display().to_string())
+            .with_detail("source", error.to_string())
+        })?;
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or(Duration::from_secs(0))
+            .as_nanos();
+        let tmp_path = self.path.with_extension(format!("json.tmp-{timestamp}"));
+
+        let write_result = (|| -> AppResult<()> {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(RESTART_STATE_MODE)
+                .open(&tmp_path)
+                .map_err(|error| {
+                    AppError::new(
+                        ErrorCode::PreconditionFailed,
+                        "restart abuse state file could not be created",
+                    )
+                    .with_detail("path", tmp_path.display().to_string())
+                    .with_detail("source", error.to_string())
+                })?;
+            file.write_all(&serialized).map_err(|error| {
+                AppError::new(
+                    ErrorCode::PreconditionFailed,
+                    "restart abuse state file could not be written",
+                )
+                .with_detail("path", tmp_path.display().to_string())
+                .with_detail("source", error.to_string())
+            })?;
+            file.sync_all().map_err(|error| {
+                AppError::new(
+                    ErrorCode::PreconditionFailed,
+                    "restart abuse state file could not be synced",
+                )
+                .with_detail("path", tmp_path.display().to_string())
+                .with_detail("source", error.to_string())
+            })?;
+            fs::rename(&tmp_path, &self.path).map_err(|error| {
+                AppError::new(
+                    ErrorCode::PreconditionFailed,
+                    "restart abuse state file could not be installed atomically",
+                )
+                .with_detail("path", self.path.display().to_string())
+                .with_detail("source", error.to_string())
+            })?;
+            Ok(())
+        })();
+
+        if write_result.is_err() {
+            let _ = fs::remove_file(&tmp_path);
+        }
+        write_result?;
+        self.validate_existing_file()
+    }
+
+    fn validate_parent_directory(&self) -> AppResult<()> {
+        let parent = self.path.parent().ok_or_else(|| {
+            AppError::new(
+                ErrorCode::PreconditionFailed,
+                "restart abuse state path must include a parent directory",
+            )
+            .with_detail("path", self.path.display().to_string())
+        })?;
+        let metadata = fs::symlink_metadata(parent).map_err(|error| {
+            AppError::new(
+                ErrorCode::PreconditionFailed,
+                "restart abuse state directory is missing or unreadable",
+            )
+            .with_detail("path", parent.display().to_string())
+            .with_detail("source", error.to_string())
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+            return Err(AppError::new(
+                ErrorCode::PreconditionFailed,
+                "restart abuse state directory must be a real directory",
+            )
+            .with_detail("path", parent.display().to_string()));
+        }
+        Ok(())
+    }
+
+    fn validate_existing_file(&self) -> AppResult<()> {
+        let metadata = fs::symlink_metadata(&self.path).map_err(|error| {
+            AppError::new(
+                ErrorCode::PreconditionFailed,
+                "restart abuse state file is missing or unreadable",
+            )
+            .with_detail("path", self.path.display().to_string())
+            .with_detail("source", error.to_string())
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return Err(AppError::new(
+                ErrorCode::PreconditionFailed,
+                "restart abuse state path must be a regular file",
+            )
+            .with_detail("path", self.path.display().to_string()));
+        }
+
+        let owner_uid = metadata.uid();
+        if owner_uid != self.expected_owner_uid {
+            return Err(AppError::new(
+                ErrorCode::PreconditionFailed,
+                "restart abuse state file owner is not trusted",
+            )
+            .with_detail("path", self.path.display().to_string())
+            .with_detail("owner_uid", owner_uid as u64)
+            .with_detail("expected_owner_uid", self.expected_owner_uid as u64));
+        }
+
+        let mode = metadata.mode() & 0o777;
+        if mode & RESTART_STATE_FORBIDDEN_MODE_BITS != 0 {
+            return Err(AppError::new(
+                ErrorCode::PreconditionFailed,
+                "restart abuse state file mode is too permissive",
+            )
+            .with_detail("path", self.path.display().to_string())
+            .with_detail("mode", format!("{mode:o}"))
+            .with_detail(
+                "forbidden_mode_bits",
+                format!("{:o}", RESTART_STATE_FORBIDDEN_MODE_BITS),
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+impl PersistedCooldownTracker {
+    fn from_tracker(tracker: &CooldownTracker) -> AppResult<Self> {
+        let last_restart = tracker
+            .last_restart
+            .iter()
+            .map(|(unit, timestamp)| Ok((unit.clone(), system_time_to_unix_seconds(*timestamp)?)))
+            .collect::<AppResult<HashMap<_, _>>>()?;
+        let recent_restarts = tracker
+            .recent_restarts
+            .iter()
+            .map(|(unit, timestamps)| {
+                let values = timestamps
+                    .iter()
+                    .map(|timestamp| system_time_to_unix_seconds(*timestamp))
+                    .collect::<AppResult<Vec<_>>>()?;
+                Ok((unit.clone(), values))
+            })
+            .collect::<AppResult<HashMap<_, _>>>()?;
+
+        Ok(Self {
+            last_restart,
+            recent_restarts,
+        })
+    }
+
+    fn into_tracker(self) -> CooldownTracker {
+        CooldownTracker {
+            last_restart: self
+                .last_restart
+                .into_iter()
+                .map(|(unit, seconds)| (unit, UNIX_EPOCH + Duration::from_secs(seconds)))
+                .collect(),
+            recent_restarts: self
+                .recent_restarts
+                .into_iter()
+                .map(|(unit, timestamps)| {
+                    (
+                        unit,
+                        timestamps
+                            .into_iter()
+                            .map(|seconds| UNIX_EPOCH + Duration::from_secs(seconds))
+                            .collect(),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+fn current_effective_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(not(test))]
+fn default_restart_state_path_for_policy(_policy_path: &PathBuf) -> PathBuf {
+    PathBuf::from(DEFAULT_RESTART_STATE_PATH)
+}
+
+#[cfg(test)]
+fn default_restart_state_path_for_policy(policy_path: &PathBuf) -> PathBuf {
+    policy_path.with_extension("restart-state.json")
+}
+
+fn system_time_to_unix_seconds(timestamp: SystemTime) -> AppResult<u64> {
+    timestamp
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .map_err(|error| {
+            AppError::new(
+                ErrorCode::PreconditionFailed,
+                "restart abuse timestamp predates unix epoch",
+            )
+            .with_detail("source", error.to_string())
+        })
 }
 
 fn validate_policy_file_for_owner(path: &std::path::Path, expected_uid: u32) -> AppResult<()> {
@@ -453,10 +793,35 @@ mod tests {
 
     fn remove_policy_file(path: &PathBuf) {
         let _ = fs::remove_file(path);
+        let _ = fs::remove_file(path.with_extension("restart-state.json"));
     }
 
     fn current_uid() -> u32 {
         unsafe { libc::geteuid() }
+    }
+
+    fn write_restart_state_file(contents: &str) -> PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "adminbot-restart-state-test-{}-{timestamp}.json",
+            process::id()
+        ));
+        fs::write(&path, contents).expect("write restart state file");
+        path
+    }
+
+    fn remove_restart_state_file(path: &PathBuf) {
+        let _ = fs::remove_file(path);
+    }
+
+    fn load_policy_engine_with_restart_state(
+        policy_path: PathBuf,
+        restart_state_path: PathBuf,
+    ) -> Result<PolicyEngine, Box<dyn std::error::Error>> {
+        PolicyEngine::load_from_paths(policy_path, restart_state_path)
     }
 
     #[test]
@@ -624,6 +989,132 @@ allowed = ["system.status"]
 
         validate_policy_file_for_owner(&path, current_uid()).expect("trusted file must pass");
         remove_policy_file(&path);
+    }
+
+    #[test]
+    fn restart_counters_persist_across_reload() {
+        let policy_path = write_policy_file(
+            r#"
+version = 1
+
+[actions]
+allowed = ["service.restart"]
+
+[service_control]
+allowed_units = ["nginx.service"]
+restart_cooldown_seconds = 300
+max_restarts_per_hour = 3
+"#,
+        );
+        let restart_state_path = write_restart_state_file("{}");
+        fs::set_permissions(
+            &restart_state_path,
+            fs::Permissions::from_mode(RESTART_STATE_MODE),
+        )
+        .expect("chmod restart state");
+
+        let engine =
+            load_policy_engine_with_restart_state(policy_path.clone(), restart_state_path.clone())
+                .expect("load policy with restart state");
+        engine.record_service_restart("nginx.service");
+        drop(engine);
+
+        let reloaded =
+            load_policy_engine_with_restart_state(policy_path.clone(), restart_state_path.clone())
+                .expect("reload policy with restart state");
+        let error = reloaded
+            .check_service_restart_allowed("nginx.service")
+            .expect_err("restart cooldown must survive reload");
+
+        remove_policy_file(&policy_path);
+        remove_restart_state_file(&restart_state_path);
+
+        assert_eq!(error.code, ErrorCode::CooldownActive);
+        assert_eq!(error.message, "restart cooldown is active");
+    }
+
+    #[test]
+    fn load_rejects_restart_state_file_with_world_writable_mode() {
+        let policy_path = write_policy_file(
+            r#"
+version = 1
+
+[actions]
+allowed = ["service.restart"]
+
+[service_control]
+allowed_units = ["nginx.service"]
+"#,
+        );
+        let restart_state_path = write_restart_state_file("{}");
+        fs::set_permissions(&restart_state_path, fs::Permissions::from_mode(0o666))
+            .expect("chmod restart state");
+
+        let error =
+            load_policy_engine_with_restart_state(policy_path.clone(), restart_state_path.clone())
+                .expect_err("world-writable restart state must fail");
+
+        remove_policy_file(&policy_path);
+        remove_restart_state_file(&restart_state_path);
+
+        let app_error = error
+            .downcast_ref::<AppError>()
+            .expect("error should be AppError");
+        assert_eq!(app_error.code, ErrorCode::PreconditionFailed);
+        assert_eq!(
+            app_error.message,
+            "restart abuse state file mode is too permissive"
+        );
+    }
+
+    #[test]
+    fn persist_failure_blocks_future_restarts_fail_closed() {
+        let policy_path = write_policy_file(
+            r#"
+version = 1
+
+[actions]
+allowed = ["service.restart"]
+
+[service_control]
+allowed_units = ["nginx.service"]
+restart_cooldown_seconds = 0
+max_restarts_per_hour = 3
+"#,
+        );
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let restart_state_dir = std::env::temp_dir().join(format!(
+            "adminbot-restart-state-dir-{}-{timestamp}",
+            process::id()
+        ));
+        fs::create_dir_all(&restart_state_dir).expect("create restart state dir");
+        let restart_state_path = restart_state_dir.join("restart_abuse_state.json");
+
+        let engine =
+            load_policy_engine_with_restart_state(policy_path.clone(), restart_state_path.clone())
+                .expect("load policy with restart state");
+
+        fs::set_permissions(&restart_state_dir, fs::Permissions::from_mode(0o500))
+            .expect("chmod dir read-only");
+        engine.record_service_restart("nginx.service");
+        let error = engine
+            .check_service_restart_allowed("nginx.service")
+            .expect_err("restart checks must fail closed when persistence breaks");
+
+        fs::set_permissions(&restart_state_dir, fs::Permissions::from_mode(0o700))
+            .expect("restore dir permissions");
+        remove_policy_file(&policy_path);
+        remove_restart_state_file(&restart_state_path);
+        let _ = fs::remove_dir(&restart_state_dir);
+
+        assert_eq!(error.code, ErrorCode::PreconditionFailed);
+        assert_eq!(
+            error.message,
+            "restart abuse state persistence is unavailable"
+        );
     }
 
     #[test]

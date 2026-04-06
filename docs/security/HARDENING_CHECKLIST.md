@@ -57,6 +57,7 @@
 [x] `allowed_request_types` nicht mehr fuer Autorisierung verwenden; getrennte Unix-User oder -Gruppen fuer getrennte Rollen erzwingen
 [x] `max_parallel_mutations` aktiv technisch erzwingen; mutierende Non-Dry-Run-Requests werden ueber dem Policy-Limit fail-fast mit `rate_limited` abgewiesen
 [x] mutierende Non-Dry-Run-Requests binden `request_id` peer-gebunden fuer `300 s`; identische Replays liefern denselben Response, mismatched Reuse wird abgewiesen
+[x] Restart-Abuse-Zaehler werden unter `/var/lib/adminbot/restart_abuse_state.json` persistiert; unsichere oder kaputte Persistenz blockiert `service.restart` fail closed
 
 ## Action- und Backend-Sicherheit
 
