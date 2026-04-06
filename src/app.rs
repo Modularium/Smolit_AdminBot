@@ -9,8 +9,6 @@ use crate::peer::PeerCredentials;
 use crate::policy::PolicyEngine;
 use crate::types::{Request, Response};
 
-pub const MUTATING_REQUEST_REPLAY_WINDOW: Duration = Duration::from_secs(300);
-
 #[derive(Debug)]
 struct MutationLimiter {
     max_parallel_mutations: usize,
@@ -64,6 +62,7 @@ struct RequestRateLimiter {
 #[derive(Debug)]
 struct ReplayProtector {
     entries: Mutex<HashMap<ReplayKey, ReplayEntry>>,
+    replay_window: Duration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -201,15 +200,14 @@ impl RequestRateLimiter {
     }
 }
 
-impl Default for ReplayProtector {
-    fn default() -> Self {
+impl ReplayProtector {
+    fn new(replay_window: Duration) -> Self {
         Self {
             entries: Mutex::new(HashMap::new()),
+            replay_window,
         }
     }
-}
 
-impl ReplayProtector {
     fn begin(&self, request: &Request, peer: &PeerCredentials) -> Result<ReplayDecision, AppError> {
         let key = ReplayKey {
             peer_uid: peer.uid,
@@ -223,7 +221,8 @@ impl ReplayProtector {
             .entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.retain(|_, entry| !entry.is_expired(now));
+        let replay_window = self.replay_window;
+        guard.retain(|_, entry| !entry.is_expired(now, replay_window));
 
         match guard.get(&key) {
             Some(ReplayEntry::InFlight {
@@ -236,14 +235,11 @@ impl ReplayProtector {
                         "mutating request replay is already in progress",
                     )
                     .with_detail("request_id", request.request_id.clone())
-                    .with_detail(
-                        "replay_window_ms",
-                        MUTATING_REQUEST_REPLAY_WINDOW.as_millis() as u64,
-                    )
+                    .with_detail("replay_window_ms", self.replay_window.as_millis() as u64)
                     .retryable(true));
                 }
 
-                return Err(replay_mismatch_error(request));
+                return Err(replay_mismatch_error(request, self.replay_window));
             }
             Some(ReplayEntry::Completed {
                 fingerprint: existing,
@@ -254,7 +250,7 @@ impl ReplayProtector {
                     return Ok(ReplayDecision::ReturnCached(response.clone()));
                 }
 
-                return Err(replay_mismatch_error(request));
+                return Err(replay_mismatch_error(request, self.replay_window));
             }
             None => {}
         }
@@ -304,17 +300,18 @@ impl ReplayProtector {
 }
 
 impl ReplayEntry {
-    fn is_expired(&self, now: Instant) -> bool {
+    fn is_expired(&self, now: Instant, replay_window: Duration) -> bool {
         let timestamp = match self {
             ReplayEntry::InFlight { started_at, .. } => *started_at,
             ReplayEntry::Completed { completed_at, .. } => *completed_at,
         };
-        now.duration_since(timestamp) >= MUTATING_REQUEST_REPLAY_WINDOW
+        now.duration_since(timestamp) >= replay_window
     }
 }
 
 impl App {
     pub fn new(policy: PolicyEngine) -> Self {
+        let replay_window = Duration::from_millis(policy.constraints().replay_window_ms.max(1));
         let request_rate_limiter = RequestRateLimiter::from_policy(&policy);
         let mutation_limiter = MutationLimiter::new(policy.constraints().max_parallel_mutations);
         Self {
@@ -322,7 +319,7 @@ impl App {
             audit: AuditLogger::default(),
             request_rate_limiter,
             mutation_limiter,
-            replay_protector: ReplayProtector::default(),
+            replay_protector: ReplayProtector::new(replay_window),
         }
     }
 
@@ -519,16 +516,13 @@ fn replay_fingerprint(request: &Request) -> Result<Vec<u8>, AppError> {
     })
 }
 
-fn replay_mismatch_error(request: &Request) -> AppError {
+fn replay_mismatch_error(request: &Request, replay_window: Duration) -> AppError {
     AppError::new(
         ErrorCode::ValidationError,
         "request_id is already bound to a different mutating request",
     )
     .with_detail("request_id", request.request_id.clone())
-    .with_detail(
-        "replay_window_ms",
-        MUTATING_REQUEST_REPLAY_WINDOW.as_millis() as u64,
-    )
+    .with_detail("replay_window_ms", replay_window.as_millis() as u64)
 }
 
 #[cfg(test)]
@@ -981,7 +975,7 @@ global_mutate_requests_per_window = 2
 
     #[test]
     fn in_flight_mutating_replay_is_retryable_rate_limited() {
-        let protector = ReplayProtector::default();
+        let protector = ReplayProtector::new(Duration::from_millis(300_000));
         let peer = current_peer();
         let request = service_restart_request("adminbot-inflight-missing.service", false);
 
@@ -999,6 +993,24 @@ global_mutate_requests_per_window = 2
             "mutating request replay is already in progress"
         );
         assert_eq!(error.retryable, true);
+    }
+
+    #[test]
+    fn high_security_profile_reduces_reported_replay_window() {
+        let protector = ReplayProtector::new(Duration::from_millis(60_000));
+        let peer = current_peer();
+        let request = service_restart_request("adminbot-inflight-missing.service", false);
+
+        let _reservation = match protector.begin(&request, &peer).expect("begin first") {
+            ReplayDecision::Execute(reservation) => reservation,
+            ReplayDecision::ReturnCached(_) => panic!("first request must not be cached"),
+        };
+
+        let error = protector
+            .begin(&request, &peer)
+            .expect_err("in-flight duplicate must fail");
+        assert_eq!(error.code, crate::error::ErrorCode::RateLimited);
+        assert_eq!(error.details.get("replay_window_ms"), Some(&json!(60_000)));
     }
 
     #[test]

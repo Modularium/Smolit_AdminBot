@@ -33,6 +33,13 @@ pub enum Capability {
     ServiceRestart,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecurityProfile {
+    Standard,
+    HighSecurity,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PolicyFile {
@@ -96,6 +103,7 @@ struct JournalPolicy {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ConstraintsPolicy {
+    security_profile: Option<SecurityProfile>,
     default_timeout_ms: Option<u64>,
     max_timeout_ms: Option<u64>,
     journal_limit_max: Option<u32>,
@@ -107,11 +115,13 @@ struct ConstraintsPolicy {
     mutate_rate_limit_window_ms: Option<u64>,
     mutate_requests_per_peer_per_window: Option<u32>,
     global_mutate_requests_per_window: Option<u32>,
+    replay_window_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct Constraints {
+    pub security_profile: SecurityProfile,
     pub default_timeout_ms: u64,
     pub max_timeout_ms: u64,
     pub journal_limit_max: u32,
@@ -123,11 +133,13 @@ pub struct Constraints {
     pub mutate_rate_limit_window_ms: u64,
     pub mutate_requests_per_peer_per_window: u32,
     pub global_mutate_requests_per_window: u32,
+    pub replay_window_ms: u64,
 }
 
 impl Default for Constraints {
     fn default() -> Self {
         Self {
+            security_profile: SecurityProfile::Standard,
             default_timeout_ms: 3000,
             max_timeout_ms: 30_000,
             journal_limit_max: 200,
@@ -139,6 +151,7 @@ impl Default for Constraints {
             mutate_rate_limit_window_ms: 60_000,
             mutate_requests_per_peer_per_window: 4,
             global_mutate_requests_per_window: 12,
+            replay_window_ms: 300_000,
         }
     }
 }
@@ -244,7 +257,12 @@ impl PolicyEngine {
             });
         }
 
+        let security_profile = parsed
+            .constraints
+            .security_profile
+            .unwrap_or(SecurityProfile::Standard);
         let constraints = Constraints {
+            security_profile,
             default_timeout_ms: parsed.constraints.default_timeout_ms.unwrap_or(3000),
             max_timeout_ms: parsed.constraints.max_timeout_ms.unwrap_or(30_000),
             journal_limit_max: parsed.constraints.journal_limit_max.unwrap_or(200),
@@ -257,11 +275,17 @@ impl PolicyEngine {
             read_requests_per_peer_per_window: parsed
                 .constraints
                 .read_requests_per_peer_per_window
-                .unwrap_or(30),
+                .unwrap_or(match security_profile {
+                    SecurityProfile::Standard => 30,
+                    SecurityProfile::HighSecurity => 10,
+                }),
             global_read_requests_per_window: parsed
                 .constraints
                 .global_read_requests_per_window
-                .unwrap_or(120),
+                .unwrap_or(match security_profile {
+                    SecurityProfile::Standard => 120,
+                    SecurityProfile::HighSecurity => 40,
+                }),
             mutate_rate_limit_window_ms: parsed
                 .constraints
                 .mutate_rate_limit_window_ms
@@ -269,11 +293,21 @@ impl PolicyEngine {
             mutate_requests_per_peer_per_window: parsed
                 .constraints
                 .mutate_requests_per_peer_per_window
-                .unwrap_or(4),
+                .unwrap_or(match security_profile {
+                    SecurityProfile::Standard => 4,
+                    SecurityProfile::HighSecurity => 2,
+                }),
             global_mutate_requests_per_window: parsed
                 .constraints
                 .global_mutate_requests_per_window
-                .unwrap_or(12),
+                .unwrap_or(match security_profile {
+                    SecurityProfile::Standard => 12,
+                    SecurityProfile::HighSecurity => 4,
+                }),
+            replay_window_ms: parsed.constraints.replay_window_ms.unwrap_or(match security_profile {
+                SecurityProfile::Standard => 300_000,
+                SecurityProfile::HighSecurity => 60_000,
+            }),
         };
         let restart_state_store =
             RestartStateStore::new(restart_state_path, current_effective_uid());
@@ -968,6 +1002,10 @@ max_parallel_mutations = 1
         assert_eq!(engine.snapshot.constraints.journal_limit_max, 50);
         assert_eq!(engine.snapshot.constraints.process_limit_max, 25);
         assert_eq!(engine.snapshot.constraints.max_parallel_mutations, 1);
+        assert_eq!(
+            engine.snapshot.constraints.security_profile,
+            SecurityProfile::Standard
+        );
         assert_eq!(engine.snapshot.constraints.read_rate_limit_window_ms, 1_000);
         assert_eq!(
             engine.snapshot.constraints.read_requests_per_peer_per_window,
@@ -983,6 +1021,7 @@ max_parallel_mutations = 1
             engine.snapshot.constraints.global_mutate_requests_per_window,
             12
         );
+        assert_eq!(engine.snapshot.constraints.replay_window_ms, 300_000);
         assert_eq!(engine.snapshot.clients.len(), 2);
 
         let service_operator = engine
@@ -1411,6 +1450,35 @@ allowed_units = ["adminbotd.service"]
         engine
             .check_journal_unit_allowed("adminbotd.service")
             .expect("journal.allowed_units should allow adminbotd.service");
+    }
+
+    #[test]
+    fn high_security_profile_applies_stricter_defaults() {
+        let path = write_policy_file(
+            r#"
+version = 1
+
+[actions]
+allowed = []
+denied = []
+
+[constraints]
+security_profile = "high_security"
+"#,
+        );
+
+        let engine = PolicyEngine::load_from_path(path.clone()).expect("load policy");
+        remove_policy_file(&path);
+
+        assert_eq!(
+            engine.snapshot.constraints.security_profile,
+            SecurityProfile::HighSecurity
+        );
+        assert_eq!(engine.snapshot.constraints.read_requests_per_peer_per_window, 10);
+        assert_eq!(engine.snapshot.constraints.global_read_requests_per_window, 40);
+        assert_eq!(engine.snapshot.constraints.mutate_requests_per_peer_per_window, 2);
+        assert_eq!(engine.snapshot.constraints.global_mutate_requests_per_window, 4);
+        assert_eq!(engine.snapshot.constraints.replay_window_ms, 60_000);
     }
 
     #[test]
