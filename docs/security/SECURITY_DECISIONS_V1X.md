@@ -97,7 +97,7 @@ Dieses Dokument haelt die sicherheitsrelevanten Entscheidungen fuer die Nachhaer
 
 - Prioritaet: `P1`
 - GitHub-Issue: `#82`
-- Entscheidung: Release und produktives Deployment gelten erst nach expliziter Pruefung von Policy, polkit, Hardening und Zielsystem-Nachweisen als freigabefaehig.
+- Entscheidung: Release und produktives Deployment gelten erst nach expliziter Pruefung von Policy, polkit, Hardening und Zielsystem-Nachweisen als freigabefaehig. Der verbindliche Gate-Check liegt als Script unter `scripts/verify_security_release_gate.sh` vor und deckt einen Repo-Artefakt-Modus sowie einen Live-Deployment-Modus ab.
 - Begruendung: ein sicherer Codepfad ist wertlos, wenn die Betriebsartefakte driften oder unreviewt ausgerollt werden.
 - Nicht Ziel: vollautomatisierte Compliance-Plattform.
 

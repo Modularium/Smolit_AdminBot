@@ -71,6 +71,24 @@ Dann:
 cargo run
 ```
 
+## Security Release Gate
+
+Der verbindliche Security-Gate-Check liegt unter:
+
+- `scripts/verify_security_release_gate.sh`
+
+Repo-/CI-Check:
+
+```bash
+bash scripts/verify_security_release_gate.sh --mode artifact
+```
+
+Zielsystem-Check:
+
+```bash
+bash scripts/verify_security_release_gate.sh --mode live
+```
+
 ## Test via Unix Socket
 
 Die mitgelieferten Skripte erzeugen das binäre `u32`-Length-Prefix und sprechen danach direkt mit dem Unix Domain Socket.

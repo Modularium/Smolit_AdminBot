@@ -48,3 +48,4 @@ Produktive Deployments muessen:
 1. die versionierte Vorlage aus dem Repository als Ausgangspunkt verwenden
 2. keine breitere parallele polkit-Regel fuer `manage-units` aktiv haben
 3. nach jeder Aenderung den echten `service.restart`-Pfad erneut validieren
+4. den Live-Release-Gate-Check gegen die installierte Regel erfolgreich ausfuehren, damit die Zielsystem-Datei nicht vom versionierten Template driftet
