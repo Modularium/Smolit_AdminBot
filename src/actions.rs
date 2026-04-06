@@ -121,6 +121,10 @@ const ACTIONS: &[ActionMetadata] = &[
     },
 ];
 
+pub const MAX_JOURNAL_MESSAGE_BYTES: usize = 2 * 1024;
+pub const MAX_JOURNAL_RESPONSE_BYTES: usize = 32 * 1024;
+const JOURNAL_MESSAGE_TRUNCATION_SUFFIX: &str = "... [truncated]";
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 enum DetailLevel {
@@ -715,14 +719,14 @@ fn journal_query(app: &App, request: &Request) -> AppResult<Value> {
             truncated = true;
             break;
         }
-        entries.push(journal_record_to_value(&record)?);
+        if !append_journal_entry_with_guardrails(&mut entries, &record)? {
+            truncated = true;
+            break;
+        }
     }
 
     entries.reverse();
-    Ok(json!({
-        "entries": entries,
-        "truncated": truncated
-    }))
+    Ok(journal_query_response(entries, truncated))
 }
 
 fn process_snapshot(request: &Request) -> AppResult<Value> {
@@ -1613,12 +1617,71 @@ fn journal_record_to_value(record: &JournalRecord) -> AppResult<Value> {
                 )
             })?;
 
+    let (message, message_truncated) =
+        truncate_journal_message(&record.message, MAX_JOURNAL_MESSAGE_BYTES);
+
     Ok(json!({
         "timestamp": timestamp,
         "unit": record.unit,
         "priority": record.priority.as_str(),
-        "message": record.message
+        "message": message,
+        "message_truncated": message_truncated
     }))
+}
+
+fn append_journal_entry_with_guardrails(
+    entries: &mut Vec<Value>,
+    record: &JournalRecord,
+) -> AppResult<bool> {
+    let entry = journal_record_to_value(record)?;
+    if !journal_response_can_include_entry(entries, &entry)? {
+        return Ok(false);
+    }
+
+    entries.push(entry);
+    Ok(true)
+}
+
+fn journal_response_can_include_entry(entries: &[Value], entry: &Value) -> AppResult<bool> {
+    let mut candidate = entries.to_vec();
+    candidate.push(entry.clone());
+    Ok(journal_query_response_size(&candidate, false)? <= MAX_JOURNAL_RESPONSE_BYTES)
+}
+
+fn journal_query_response(entries: Vec<Value>, truncated: bool) -> Value {
+    json!({
+        "entries": entries,
+        "truncated": truncated
+    })
+}
+
+fn journal_query_response_size(entries: &[Value], truncated: bool) -> AppResult<usize> {
+    serde_json::to_vec(&journal_query_response(entries.to_vec(), truncated))
+        .map(|encoded| encoded.len())
+        .map_err(|error| {
+            AppError::new(
+                ErrorCode::ExecutionFailed,
+                "unable to encode journal query response",
+            )
+            .with_detail("source", error.to_string())
+        })
+}
+
+fn truncate_journal_message(message: &str, max_bytes: usize) -> (String, bool) {
+    if message.len() <= max_bytes {
+        return (message.to_string(), false);
+    }
+
+    let max_bytes = max_bytes.max(JOURNAL_MESSAGE_TRUNCATION_SUFFIX.len());
+    let prefix_budget = max_bytes - JOURNAL_MESSAGE_TRUNCATION_SUFFIX.len();
+    let mut end = prefix_budget.min(message.len());
+    while end > 0 && !message.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    let mut clipped = message[..end].to_string();
+    clipped.push_str(JOURNAL_MESSAGE_TRUNCATION_SUFFIX);
+    (clipped, true)
 }
 
 #[cfg(test)]
@@ -1920,6 +1983,78 @@ mod tests {
         assert_eq!(value["unit"], json!("nginx.service"));
         assert_eq!(value["priority"], json!("warning"));
         assert_eq!(value["message"], json!("upstream connection slow"));
+        assert_eq!(value["message_truncated"], json!(false));
+    }
+
+    #[test]
+    fn journal_record_to_value_clips_large_messages() {
+        let record = JournalRecord {
+            timestamp_usec: 1_710_000_000_000_000,
+            unit: "nginx.service".to_string(),
+            priority: JournalPriority::Warning,
+            message: "x".repeat(MAX_JOURNAL_MESSAGE_BYTES * 2),
+        };
+
+        let value = journal_record_to_value(&record).expect("journal record value");
+        let message = value["message"].as_str().expect("message");
+
+        assert_eq!(value["message_truncated"], json!(true));
+        assert!(message.ends_with(JOURNAL_MESSAGE_TRUNCATION_SUFFIX));
+        assert!(message.len() <= MAX_JOURNAL_MESSAGE_BYTES);
+    }
+
+    #[test]
+    fn journal_response_guardrails_allow_normal_queries() {
+        let mut entries = Vec::new();
+        let first = JournalRecord {
+            timestamp_usec: 1_710_000_000_000_000,
+            unit: "nginx.service".to_string(),
+            priority: JournalPriority::Warning,
+            message: "worker restarted".to_string(),
+        };
+        let second = JournalRecord {
+            timestamp_usec: 1_710_000_000_100_000,
+            unit: "nginx.service".to_string(),
+            priority: JournalPriority::Error,
+            message: "upstream timeout".to_string(),
+        };
+
+        assert!(append_journal_entry_with_guardrails(&mut entries, &first).expect("append first"));
+        assert!(append_journal_entry_with_guardrails(&mut entries, &second).expect("append second"));
+        assert_eq!(entries.len(), 2);
+        assert!(
+            journal_query_response_size(&entries, false).expect("response size")
+                <= MAX_JOURNAL_RESPONSE_BYTES
+        );
+    }
+
+    #[test]
+    fn journal_response_guardrails_truncate_large_queries_deterministically() {
+        let record = JournalRecord {
+            timestamp_usec: 1_710_000_000_000_000,
+            unit: "nginx.service".to_string(),
+            priority: JournalPriority::Warning,
+            message: "x".repeat(MAX_JOURNAL_MESSAGE_BYTES * 2),
+        };
+        let mut entries = Vec::new();
+        let mut appended = 0_usize;
+
+        loop {
+            let accepted =
+                append_journal_entry_with_guardrails(&mut entries, &record).expect("append");
+            if !accepted {
+                break;
+            }
+            appended += 1;
+        }
+
+        assert!(appended > 0);
+        assert!(
+            journal_query_response_size(&entries, true).expect("response size")
+                <= MAX_JOURNAL_RESPONSE_BYTES
+        );
+        assert!(!append_journal_entry_with_guardrails(&mut entries, &record)
+            .expect("reject next entry"));
     }
 
     #[test]

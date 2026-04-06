@@ -65,7 +65,7 @@
 [x] kein Shell-Fallback
 [x] Unit-Namen werden strikt validiert
 [x] Journal-Queries sind begrenzt nach Count und Zeitfenster
-[ ] globale Groessenbegrenzung fuer ausgehende Journal-Daten bewerten
+[x] Journal-Queries clippen einzelne `MESSAGE`-Felder auf `2048 Bytes` und begrenzen die gesamte JSON-Antwort deterministisch auf `32768 Bytes`
 [ ] Sensitivitaet von Read-only Endpoints pro Deployment explizit freigeben
 [ ] D-Bus- und journald-Ausfallpfade betrieblich absichern
 

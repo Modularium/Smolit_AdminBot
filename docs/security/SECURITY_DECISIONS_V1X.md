@@ -81,7 +81,7 @@ Dieses Dokument haelt die sicherheitsrelevanten Entscheidungen fuer die Nachhaer
 
 - Prioritaet: `P1`
 - GitHub-Issue: `#80`
-- Entscheidung: Read-only Datenpfade muessen auch globale Groessen- und Exfiltrationsgrenzen beachten.
+- Entscheidung: Read-only Datenpfade muessen auch globale Groessen- und Exfiltrationsgrenzen beachten. `journal.query` clippt einzelne Journalnachrichten deshalb auf `2048 Bytes` und begrenzt die gesamte JSON-Antwort deterministisch auf `32768 Bytes`.
 - Begruendung: Count- und Zeitfenstergrenzen allein reduzieren Informationsabfluss nicht ausreichend.
 - Nicht Ziel: generische Inhaltsklassifikation fuer alle Logs in derselben Phase.
 
