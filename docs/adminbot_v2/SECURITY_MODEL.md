@@ -427,6 +427,7 @@ Mindestens zu loggen:
 ## Korrelation
 
 - `request_id` identifiziert genau einen AdminBot-Request
+- fuer mutierende Non-Dry-Run-Requests ist `request_id` zusaetzlich fuer ein kurzes, peer-gebundenes Replay-Fenster ein Idempotency-Key
 - `correlation_id` verknüpft mehrere Requests zu Incident, Task oder Agent-Lauf
 - `audit_ref` kommt in jede Response
 

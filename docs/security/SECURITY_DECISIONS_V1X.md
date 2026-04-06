@@ -105,7 +105,7 @@ Dieses Dokument haelt die sicherheitsrelevanten Entscheidungen fuer die Nachhaer
 
 - Prioritaet: `P2`
 - GitHub-Issue: `#83`
-- Entscheidung: mutierende Requests erhalten eine dokumentierte Strategie fuer Wiederholung, Duplikaterkennung oder Idempotenz.
+- Entscheidung: mutierende Non-Dry-Run-Requests behandeln `request_id` fuer ein peer-gebundenes Fenster von `300 s` als Idempotency-Key. Identische Replays liefern denselben gecachten Response, parallele Duplikate werden retryable mit `rate_limited` abgewiesen und mismatched Wiederverwendung derselben `request_id` wird als `validation_error` verworfen.
 - Begruendung: wiederholte lokale Requests koennen trotz Policy und Cooldown operative Nebenwirkungen erzeugen.
 - Nicht Ziel: verteilter Exactly-Once-Mechanismus.
 
