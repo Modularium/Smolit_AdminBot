@@ -1,0 +1,31 @@
+version = 1
+
+[clients.local_cli]
+unix_user = "dev"
+allowed_capabilities = ["read_basic", "read_sensitive", "service_read"]
+
+[actions]
+allowed = [
+  "system.status",
+  "system.health",
+  "resource.snapshot",
+  "disk.usage",
+  "network.interface_status",
+  "service.status",
+  "journal.query",
+  "process.snapshot",
+  "service.restart",
+]
+denied = []
+
+[service_control]
+allowed_units = ["nginx.service"]
+restart_cooldown_seconds = 300
+max_restarts_per_hour = 3
+
+[constraints]
+default_timeout_ms = 3000
+max_timeout_ms = 30000
+journal_limit_max = 200
+process_limit_max = 50
+max_parallel_mutations = 1
