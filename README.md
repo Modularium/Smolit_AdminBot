@@ -32,6 +32,7 @@ sudo chown root:root /etc/adminbot/policy.toml
 ```
 
 Die Beispielpolicy ist bewusst konservativ und gibt dem lokalen Beispielclient nur Read-only-Capabilities.
+Sie vergibt standardmaessig **kein** `read_sensitive` und schaltet weder `journal.query` noch `process.snapshot` oder `service.restart` im Default frei.
 
 `adminbotd` startet fail closed, wenn `/etc/adminbot/policy.toml` nicht root-owned ist oder group-/world-writable bleibt.
 

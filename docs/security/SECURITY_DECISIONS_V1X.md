@@ -137,7 +137,7 @@ Dieses Dokument haelt die sicherheitsrelevanten Entscheidungen fuer die Nachhaer
 
 - Prioritaet: `P3`
 - GitHub-Issue: `#87`
-- Entscheidung: Read-only Actions werden nicht pauschal als harmlos betrachtet, sondern nach Sensitivitaet klassifiziert.
+- Entscheidung: Read-only Actions werden in `docs/security/READ_ONLY_ACTION_SENSITIVITY.md` nach Informationsabfluss-Risiko klassifiziert. Die versionierte `config/policy.example.toml` bleibt standardmaessig ohne `read_sensitive`, `journal.query`, `process.snapshot` und ohne mutierende Actions.
 - Begruendung: Informationen ueber Journald, Services, Dateisystem und Systemzustand koennen fuer Spaehung oder Planung missbraucht werden.
 - Nicht Ziel: sofortige funktionale Beschneidung aller Read-only Actions.
 
