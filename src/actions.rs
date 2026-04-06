@@ -1,8 +1,9 @@
 use std::collections::{BTreeSet, HashMap};
+use std::ffi::CString;
 use std::fs;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -230,6 +231,105 @@ struct ServiceStatusView {
     unit_file_state: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JournalPriority {
+    Emergency,
+    Alert,
+    Critical,
+    Error,
+    Warning,
+    Notice,
+    Info,
+    Debug,
+}
+
+impl JournalPriority {
+    fn from_raw(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::Emergency),
+            1 => Some(Self::Alert),
+            2 => Some(Self::Critical),
+            3 => Some(Self::Error),
+            4 => Some(Self::Warning),
+            5 => Some(Self::Notice),
+            6 => Some(Self::Info),
+            7 => Some(Self::Debug),
+            _ => None,
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            Self::Emergency => 0,
+            Self::Alert => 1,
+            Self::Critical => 2,
+            Self::Error => 3,
+            Self::Warning => 4,
+            Self::Notice => 5,
+            Self::Info => 6,
+            Self::Debug => 7,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Emergency => "emergency",
+            Self::Alert => "alert",
+            Self::Critical => "critical",
+            Self::Error => "error",
+            Self::Warning => "warning",
+            Self::Notice => "notice",
+            Self::Info => "info",
+            Self::Debug => "debug",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct JournalRecord {
+    timestamp_usec: u64,
+    unit: String,
+    priority: JournalPriority,
+    message: String,
+}
+
+#[repr(C)]
+struct SdJournal {
+    _private: [u8; 0],
+}
+
+#[link(name = "systemd")]
+unsafe extern "C" {
+    fn sd_journal_open(ret: *mut *mut SdJournal, flags: libc::c_int) -> libc::c_int;
+    fn sd_journal_close(j: *mut SdJournal);
+    fn sd_journal_seek_tail(j: *mut SdJournal) -> libc::c_int;
+    fn sd_journal_previous(j: *mut SdJournal) -> libc::c_int;
+    fn sd_journal_get_realtime_usec(j: *mut SdJournal, ret: *mut u64) -> libc::c_int;
+    fn sd_journal_get_data(
+        j: *mut SdJournal,
+        field: *const libc::c_char,
+        data: *mut *const libc::c_void,
+        length: *mut usize,
+    ) -> libc::c_int;
+    fn sd_journal_add_match(
+        j: *mut SdJournal,
+        data: *const libc::c_void,
+        size: usize,
+    ) -> libc::c_int;
+}
+
+struct JournalHandle {
+    raw: *mut SdJournal,
+}
+
+impl Drop for JournalHandle {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe { sd_journal_close(self.raw) };
+        }
+    }
+}
+
 pub fn metadata(action: &str) -> Option<ActionMetadata> {
     ACTIONS.iter().find(|entry| entry.name == action).copied()
 }
@@ -281,11 +381,12 @@ fn execute_handler(app: &App, request: &Request, handler: ActionHandler) -> AppR
         ActionHandler::DiskUsage => disk_usage(request),
         ActionHandler::NetworkInterfaceStatus => network_interface_status(request),
         ActionHandler::ServiceStatus => service_status(request),
-        ActionHandler::ServiceRestart => service_restart(app, request),
-        ActionHandler::JournalQuery | ActionHandler::ProcessSnapshot => Err(AppError::new(
+        ActionHandler::JournalQuery => journal_query(app, request),
+        ActionHandler::ProcessSnapshot => Err(AppError::new(
             ErrorCode::BackendUnavailable,
             "action is registered but not implemented in this minimal build",
         )),
+        ActionHandler::ServiceRestart => service_restart(app, request),
     }
 }
 
@@ -337,9 +438,11 @@ fn validate_params(action: &str, params: &Value, app: &App) -> AppResult<()> {
             let parsed = from_params::<JournalQueryParams>(params)?;
             if let Some(unit) = parsed.unit {
                 validate_unit(&unit)?;
+                app.policy().check_service_unit_allowed(&unit)?;
             }
             let _ = parsed.priority_min;
-            if parsed.limit.unwrap_or(50) > app.policy().constraints().journal_limit_max {
+            let limit = parsed.limit.unwrap_or(50);
+            if limit == 0 || limit > app.policy().constraints().journal_limit_max {
                 return Err(AppError::new(
                     ErrorCode::ValidationError,
                     "journal limit exceeds policy maximum",
@@ -567,6 +670,47 @@ fn service_status(request: &Request) -> AppResult<Value> {
     }))
 }
 
+fn journal_query(app: &App, request: &Request) -> AppResult<Value> {
+    let params = from_params::<JournalQueryParams>(&request.params_value())?;
+    if let Some(unit) = params.unit.as_deref() {
+        app.policy().check_service_unit_allowed(unit)?;
+    }
+
+    let cutoff_usec = cutoff_realtime_usec(params.since_seconds.unwrap_or(3600))?;
+    let mut journal = JournalHandle::open()?;
+    if let Some(unit) = params.unit.as_deref() {
+        journal.add_match(&format!("_SYSTEMD_UNIT={unit}"))?;
+    }
+    journal.seek_tail()?;
+
+    let limit = params.limit.unwrap_or(50) as usize;
+    let mut entries = Vec::new();
+    let mut truncated = false;
+
+    while journal.previous()? {
+        let Some(record) = journal.read_record()? else {
+            continue;
+        };
+        if record.timestamp_usec < cutoff_usec {
+            break;
+        }
+        if !priority_matches_filter(record.priority, params.priority_min.as_ref()) {
+            continue;
+        }
+        if entries.len() >= limit {
+            truncated = true;
+            break;
+        }
+        entries.push(journal_record_to_value(&record)?);
+    }
+
+    entries.reverse();
+    Ok(json!({
+        "entries": entries,
+        "truncated": truncated
+    }))
+}
+
 fn service_restart(app: &App, request: &Request) -> AppResult<Value> {
     let params = from_params::<ServiceRestartParams>(&request.params_value())?;
     app.policy().check_service_restart_allowed(&params.unit)?;
@@ -739,6 +883,153 @@ fn property_error(property: &str, source: String) -> AppError {
     )
     .with_detail("property", property.to_string())
     .with_detail("source", source)
+}
+
+impl JournalHandle {
+    fn open() -> AppResult<Self> {
+        let mut raw = std::ptr::null_mut();
+        let status = unsafe { sd_journal_open(&mut raw, 0) };
+        if status < 0 || raw.is_null() {
+            return Err(AppError::new(
+                ErrorCode::BackendUnavailable,
+                "unable to open journald reader",
+            )
+            .with_detail("status", status as i64)
+            .retryable(true));
+        }
+
+        Ok(Self { raw })
+    }
+
+    fn add_match(&mut self, expression: &str) -> AppResult<()> {
+        let data = expression.as_bytes();
+        let status = unsafe {
+            sd_journal_add_match(self.raw, data.as_ptr().cast::<libc::c_void>(), data.len())
+        };
+        if status < 0 {
+            return Err(AppError::new(
+                ErrorCode::ExecutionFailed,
+                "unable to apply journal filter",
+            )
+            .with_detail("filter", expression.to_string())
+            .with_detail("status", status as i64));
+        }
+
+        Ok(())
+    }
+
+    fn seek_tail(&mut self) -> AppResult<()> {
+        let status = unsafe { sd_journal_seek_tail(self.raw) };
+        if status < 0 {
+            return Err(AppError::new(
+                ErrorCode::BackendUnavailable,
+                "unable to seek journald tail",
+            )
+            .with_detail("status", status as i64)
+            .retryable(true));
+        }
+
+        Ok(())
+    }
+
+    fn previous(&mut self) -> AppResult<bool> {
+        let status = unsafe { sd_journal_previous(self.raw) };
+        if status < 0 {
+            return Err(AppError::new(
+                ErrorCode::ExecutionFailed,
+                "unable to read previous journal entry",
+            )
+            .with_detail("status", status as i64));
+        }
+
+        Ok(status > 0)
+    }
+
+    fn read_record(&mut self) -> AppResult<Option<JournalRecord>> {
+        let timestamp_usec = self.read_timestamp_usec()?;
+        let Some(unit) = self.read_field("_SYSTEMD_UNIT")? else {
+            return Ok(None);
+        };
+        let Some(priority) = self.read_priority()? else {
+            return Ok(None);
+        };
+        let Some(message) = self.read_field("MESSAGE")? else {
+            return Ok(None);
+        };
+
+        Ok(Some(JournalRecord {
+            timestamp_usec,
+            unit,
+            priority,
+            message,
+        }))
+    }
+
+    fn read_timestamp_usec(&mut self) -> AppResult<u64> {
+        let mut value = 0_u64;
+        let status = unsafe { sd_journal_get_realtime_usec(self.raw, &mut value) };
+        if status < 0 {
+            return Err(AppError::new(
+                ErrorCode::ExecutionFailed,
+                "unable to read journal entry timestamp",
+            )
+            .with_detail("status", status as i64));
+        }
+
+        Ok(value)
+    }
+
+    fn read_priority(&mut self) -> AppResult<Option<JournalPriority>> {
+        let Some(value) = self.read_field("PRIORITY")? else {
+            return Ok(None);
+        };
+        let parsed = value.parse::<u8>().ok().and_then(JournalPriority::from_raw);
+        Ok(parsed)
+    }
+
+    fn read_field(&mut self, field: &str) -> AppResult<Option<String>> {
+        let c_field = CString::new(field).map_err(|_| {
+            AppError::new(ErrorCode::ExecutionFailed, "journal field name is invalid")
+                .with_detail("field", field.to_string())
+        })?;
+        let mut data = std::ptr::null();
+        let mut length = 0_usize;
+        let status =
+            unsafe { sd_journal_get_data(self.raw, c_field.as_ptr(), &mut data, &mut length) };
+        if status < 0 {
+            return Ok(None);
+        }
+        if data.is_null() || length == 0 {
+            return Ok(None);
+        }
+
+        let bytes = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), length) };
+        let Some(separator_index) = bytes.iter().position(|byte| *byte == b'=') else {
+            return Ok(None);
+        };
+        let key = &bytes[..separator_index];
+        let value = &bytes[separator_index + 1..];
+        if key != field.as_bytes() {
+            return Ok(None);
+        }
+
+        let text = std::str::from_utf8(value)
+            .map_err(|_| {
+                AppError::new(
+                    ErrorCode::ExecutionFailed,
+                    "journal field is not valid UTF-8",
+                )
+                .with_detail("field", field.to_string())
+            })?
+            .trim_end_matches('\0')
+            .trim()
+            .to_string();
+        if text.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(text))
+    }
 }
 
 fn from_params<T>(value: &Value) -> AppResult<T>
@@ -1042,6 +1333,53 @@ fn restart_mode_name(mode: &ServiceRestartMode) -> &'static str {
     }
 }
 
+fn cutoff_realtime_usec(since_seconds: u64) -> AppResult<u64> {
+    let cutoff = SystemTime::now()
+        .checked_sub(Duration::from_secs(since_seconds))
+        .unwrap_or(UNIX_EPOCH);
+    let duration = cutoff.duration_since(UNIX_EPOCH).map_err(|_| {
+        AppError::new(
+            ErrorCode::ExecutionFailed,
+            "unable to compute journal query time window",
+        )
+    })?;
+    Ok(duration.as_secs().saturating_mul(1_000_000) + u64::from(duration.subsec_micros()))
+}
+
+fn priority_matches_filter(priority: JournalPriority, minimum: Option<&PriorityMin>) -> bool {
+    match minimum {
+        Some(PriorityMin::Warning) => priority.code() <= JournalPriority::Warning.code(),
+        Some(PriorityMin::Error) => priority.code() <= JournalPriority::Error.code(),
+        Some(PriorityMin::Critical) => priority.code() <= JournalPriority::Critical.code(),
+        None => true,
+    }
+}
+
+fn journal_record_to_value(record: &JournalRecord) -> AppResult<Value> {
+    let timestamp =
+        OffsetDateTime::from_unix_timestamp_nanos(record.timestamp_usec as i128 * 1_000)
+            .map_err(|_| {
+                AppError::new(
+                    ErrorCode::ExecutionFailed,
+                    "unable to convert journal timestamp",
+                )
+            })?
+            .format(&Rfc3339)
+            .map_err(|_| {
+                AppError::new(
+                    ErrorCode::ExecutionFailed,
+                    "unable to format journal timestamp",
+                )
+            })?;
+
+    Ok(json!({
+        "timestamp": timestamp,
+        "unit": record.unit,
+        "priority": record.priority.as_str(),
+        "message": record.message
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1252,6 +1590,70 @@ mod tests {
             error.message,
             "mounts must contain between 1 and 16 entries"
         );
+    }
+
+    #[test]
+    fn validate_request_shape_rejects_zero_journal_limit() {
+        let app = App::new(policy_for_current_user());
+        let request = Request {
+            version: 1,
+            request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62577".to_string(),
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Human,
+                id: "validator-test".to_string(),
+            },
+            action: "journal.query".to_string(),
+            params: serde_json::from_value(json!({
+                "limit": 0
+            }))
+            .expect("params"),
+            dry_run: false,
+            timeout_ms: 3000,
+        };
+
+        let error = validate_request_shape(&request, &app).expect_err("journal limit violation");
+        assert_eq!(error.code, ErrorCode::ValidationError);
+        assert_eq!(error.message, "journal limit exceeds policy maximum");
+    }
+
+    #[test]
+    fn priority_matches_filter_respects_thresholds() {
+        assert!(priority_matches_filter(
+            JournalPriority::Warning,
+            Some(&PriorityMin::Warning)
+        ));
+        assert!(priority_matches_filter(
+            JournalPriority::Error,
+            Some(&PriorityMin::Warning)
+        ));
+        assert!(!priority_matches_filter(
+            JournalPriority::Notice,
+            Some(&PriorityMin::Warning)
+        ));
+        assert!(priority_matches_filter(
+            JournalPriority::Critical,
+            Some(&PriorityMin::Error)
+        ));
+        assert!(!priority_matches_filter(
+            JournalPriority::Warning,
+            Some(&PriorityMin::Error)
+        ));
+    }
+
+    #[test]
+    fn journal_record_to_value_returns_documented_schema() {
+        let value = journal_record_to_value(&JournalRecord {
+            timestamp_usec: 1_710_000_000_000_000,
+            unit: "nginx.service".to_string(),
+            priority: JournalPriority::Warning,
+            message: "upstream connection slow".to_string(),
+        })
+        .expect("journal record value");
+
+        assert!(value["timestamp"].as_str().is_some());
+        assert_eq!(value["unit"], json!("nginx.service"));
+        assert_eq!(value["priority"], json!("warning"));
+        assert_eq!(value["message"], json!("upstream connection slow"));
     }
 
     fn policy_for_current_user() -> PolicyEngine {
