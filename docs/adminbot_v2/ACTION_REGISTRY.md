@@ -218,7 +218,7 @@ Begründung:
   }
   ```
 - Preconditions:
-  - Mountpoints müssen in der Policy-Whitelist stehen
+  - Mountpoints müssen in `filesystem.allowed_mounts` der Policy-Whitelist stehen
 - Side Effects:
   - keine
 - Dry-Run:
@@ -476,6 +476,9 @@ allowed = [
   "service.restart",
 ]
 denied = []
+
+[filesystem]
+allowed_mounts = ["/", "/var"]
 
 [service_control]
 allowed_units = ["nginx.service", "ssh.service"]
