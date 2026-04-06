@@ -14,6 +14,16 @@ WorkingDirectory=/var/lib/adminbot
 ExecStart=/usr/local/bin/adminbotd
 Restart=on-failure
 RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+LockPersonality=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX
 
 # v1 fixed paths from docs/adminbot_v2/*
 # - policy: /etc/adminbot/policy.toml
