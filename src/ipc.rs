@@ -177,6 +177,20 @@ mod tests {
     }
 
     #[test]
+    fn framing_rejects_incomplete_length_prefix() {
+        let mut cursor = Cursor::new(vec![0_u8, 0_u8, 0_u8]);
+        let error = read_frame_from_reader(&mut cursor).expect_err("short prefix must fail");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn framing_rejects_incomplete_payload() {
+        let mut cursor = Cursor::new(vec![0_u8, 0_u8, 0_u8, 5_u8, 1_u8, 2_u8]);
+        let error = read_frame_from_reader(&mut cursor).expect_err("short payload must fail");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
     fn bind_creates_unix_socket_file() {
         let path = temp_socket_path("bind");
         let server = IpcServer::bind_for_test(path.clone()).expect("bind");
