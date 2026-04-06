@@ -89,6 +89,12 @@ struct ConstraintsPolicy {
     journal_limit_max: Option<u32>,
     process_limit_max: Option<u32>,
     max_parallel_mutations: Option<u32>,
+    read_rate_limit_window_ms: Option<u64>,
+    read_requests_per_peer_per_window: Option<u32>,
+    global_read_requests_per_window: Option<u32>,
+    mutate_rate_limit_window_ms: Option<u64>,
+    mutate_requests_per_peer_per_window: Option<u32>,
+    global_mutate_requests_per_window: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -99,6 +105,12 @@ pub struct Constraints {
     pub journal_limit_max: u32,
     pub process_limit_max: u32,
     pub max_parallel_mutations: u32,
+    pub read_rate_limit_window_ms: u64,
+    pub read_requests_per_peer_per_window: u32,
+    pub global_read_requests_per_window: u32,
+    pub mutate_rate_limit_window_ms: u64,
+    pub mutate_requests_per_peer_per_window: u32,
+    pub global_mutate_requests_per_window: u32,
 }
 
 impl Default for Constraints {
@@ -109,6 +121,12 @@ impl Default for Constraints {
             journal_limit_max: 200,
             process_limit_max: 50,
             max_parallel_mutations: 1,
+            read_rate_limit_window_ms: 1_000,
+            read_requests_per_peer_per_window: 30,
+            global_read_requests_per_window: 120,
+            mutate_rate_limit_window_ms: 60_000,
+            mutate_requests_per_peer_per_window: 4,
+            global_mutate_requests_per_window: 12,
         }
     }
 }
@@ -219,6 +237,30 @@ impl PolicyEngine {
             journal_limit_max: parsed.constraints.journal_limit_max.unwrap_or(200),
             process_limit_max: parsed.constraints.process_limit_max.unwrap_or(50),
             max_parallel_mutations: parsed.constraints.max_parallel_mutations.unwrap_or(1),
+            read_rate_limit_window_ms: parsed
+                .constraints
+                .read_rate_limit_window_ms
+                .unwrap_or(1_000),
+            read_requests_per_peer_per_window: parsed
+                .constraints
+                .read_requests_per_peer_per_window
+                .unwrap_or(30),
+            global_read_requests_per_window: parsed
+                .constraints
+                .global_read_requests_per_window
+                .unwrap_or(120),
+            mutate_rate_limit_window_ms: parsed
+                .constraints
+                .mutate_rate_limit_window_ms
+                .unwrap_or(60_000),
+            mutate_requests_per_peer_per_window: parsed
+                .constraints
+                .mutate_requests_per_peer_per_window
+                .unwrap_or(4),
+            global_mutate_requests_per_window: parsed
+                .constraints
+                .global_mutate_requests_per_window
+                .unwrap_or(12),
         };
         let restart_state_store =
             RestartStateStore::new(restart_state_path, current_effective_uid());
@@ -877,6 +919,21 @@ max_parallel_mutations = 1
         assert_eq!(engine.snapshot.constraints.journal_limit_max, 50);
         assert_eq!(engine.snapshot.constraints.process_limit_max, 25);
         assert_eq!(engine.snapshot.constraints.max_parallel_mutations, 1);
+        assert_eq!(engine.snapshot.constraints.read_rate_limit_window_ms, 1_000);
+        assert_eq!(
+            engine.snapshot.constraints.read_requests_per_peer_per_window,
+            30
+        );
+        assert_eq!(engine.snapshot.constraints.global_read_requests_per_window, 120);
+        assert_eq!(engine.snapshot.constraints.mutate_rate_limit_window_ms, 60_000);
+        assert_eq!(
+            engine.snapshot.constraints.mutate_requests_per_peer_per_window,
+            4
+        );
+        assert_eq!(
+            engine.snapshot.constraints.global_mutate_requests_per_window,
+            12
+        );
         assert_eq!(engine.snapshot.clients.len(), 2);
 
         let service_operator = engine
