@@ -231,6 +231,23 @@ struct ServiceStatusView {
     unit_file_state: String,
 }
 
+#[derive(Debug, Clone)]
+struct ProcessSnapshotEntry {
+    pid: u32,
+    name: String,
+    cpu_percent: f64,
+    memory_percent: f64,
+    started_at: String,
+}
+
+#[derive(Debug)]
+struct ProcessSystemContext {
+    uptime_secs: f64,
+    total_memory_bytes: u64,
+    boot_time_unix_secs: i64,
+    clock_ticks_per_second: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JournalPriority {
     Emergency,
@@ -382,10 +399,7 @@ fn execute_handler(app: &App, request: &Request, handler: ActionHandler) -> AppR
         ActionHandler::NetworkInterfaceStatus => network_interface_status(request),
         ActionHandler::ServiceStatus => service_status(request),
         ActionHandler::JournalQuery => journal_query(app, request),
-        ActionHandler::ProcessSnapshot => Err(AppError::new(
-            ErrorCode::BackendUnavailable,
-            "action is registered but not implemented in this minimal build",
-        )),
+        ActionHandler::ProcessSnapshot => process_snapshot(request),
         ActionHandler::ServiceRestart => service_restart(app, request),
     }
 }
@@ -711,6 +725,56 @@ fn journal_query(app: &App, request: &Request) -> AppResult<Value> {
     }))
 }
 
+fn process_snapshot(request: &Request) -> AppResult<Value> {
+    let params = from_params::<ProcessSnapshotParams>(&request.params_value())?;
+    let context = read_process_system_context()?;
+    let mut processes = collect_process_snapshots(&context)?;
+
+    processes.sort_by(|left, right| {
+        let ordering = match params.top_by {
+            ProcessTopBy::Cpu => right
+                .cpu_percent
+                .partial_cmp(&left.cpu_percent)
+                .unwrap_or(std::cmp::Ordering::Equal),
+            ProcessTopBy::Memory => right
+                .memory_percent
+                .partial_cmp(&left.memory_percent)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        };
+
+        ordering
+            .then_with(|| {
+                right
+                    .memory_percent
+                    .partial_cmp(&left.memory_percent)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| {
+                right
+                    .cpu_percent
+                    .partial_cmp(&left.cpu_percent)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| left.pid.cmp(&right.pid))
+    });
+
+    processes.truncate(params.limit as usize);
+    let processes = processes
+        .into_iter()
+        .map(|entry| {
+            json!({
+                "pid": entry.pid,
+                "name": entry.name,
+                "cpu_percent": entry.cpu_percent,
+                "memory_percent": entry.memory_percent,
+                "started_at": entry.started_at
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({ "processes": processes }))
+}
+
 fn service_restart(app: &App, request: &Request) -> AppResult<Value> {
     let params = from_params::<ServiceRestartParams>(&request.params_value())?;
     app.policy().check_service_restart_allowed(&params.unit)?;
@@ -1032,6 +1096,134 @@ impl JournalHandle {
     }
 }
 
+fn read_process_system_context() -> AppResult<ProcessSystemContext> {
+    let uptime_secs = read_uptime_seconds_precise()?;
+    let total_memory_bytes = read_mem_total_bytes()?;
+    let boot_time_unix_secs = read_boot_time_unix_secs()?;
+    let clock_ticks_per_second = clock_ticks_per_second()?;
+
+    Ok(ProcessSystemContext {
+        uptime_secs,
+        total_memory_bytes,
+        boot_time_unix_secs,
+        clock_ticks_per_second,
+    })
+}
+
+fn collect_process_snapshots(
+    context: &ProcessSystemContext,
+) -> AppResult<Vec<ProcessSnapshotEntry>> {
+    let proc_entries = fs::read_dir("/proc")
+        .map_err(|_| AppError::new(ErrorCode::ExecutionFailed, "unable to enumerate processes"))?;
+    let mut snapshots = Vec::new();
+
+    for proc_entry in proc_entries {
+        let Ok(proc_entry) = proc_entry else {
+            continue;
+        };
+        let Some(file_name) = proc_entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Ok(pid) = file_name.parse::<u32>() else {
+            continue;
+        };
+
+        let stat_path = format!("/proc/{pid}/stat");
+        let Ok(stat_content) = fs::read_to_string(stat_path) else {
+            continue;
+        };
+        let Ok((name, total_cpu_ticks, start_ticks, rss_pages)) =
+            parse_proc_stat_line(&stat_content)
+        else {
+            continue;
+        };
+
+        let entry =
+            process_snapshot_entry(pid, &name, total_cpu_ticks, start_ticks, rss_pages, context)?;
+        snapshots.push(entry);
+    }
+
+    Ok(snapshots)
+}
+
+fn process_snapshot_entry(
+    pid: u32,
+    name: &str,
+    total_cpu_ticks: u64,
+    start_ticks: u64,
+    rss_pages: i64,
+    context: &ProcessSystemContext,
+) -> AppResult<ProcessSnapshotEntry> {
+    let clock_ticks = context.clock_ticks_per_second as f64;
+    let total_cpu_seconds = total_cpu_ticks as f64 / clock_ticks;
+    let started_after_boot_secs = start_ticks as f64 / clock_ticks;
+    let elapsed_secs = (context.uptime_secs - started_after_boot_secs).max(0.001);
+    let cpu_percent = round_percent((total_cpu_seconds / elapsed_secs) * 100.0);
+
+    let page_size = page_size_bytes()?;
+    let rss_pages = rss_pages.max(0) as u64;
+    let rss_bytes = rss_pages.saturating_mul(page_size);
+    let memory_percent = if context.total_memory_bytes == 0 {
+        0.0
+    } else {
+        round_percent((rss_bytes as f64 / context.total_memory_bytes as f64) * 100.0)
+    };
+
+    let started_at = started_at_rfc3339(
+        context.boot_time_unix_secs,
+        start_ticks,
+        context.clock_ticks_per_second,
+    )?;
+
+    Ok(ProcessSnapshotEntry {
+        pid,
+        name: name.to_string(),
+        cpu_percent,
+        memory_percent,
+        started_at,
+    })
+}
+
+fn parse_proc_stat_line(line: &str) -> AppResult<(String, u64, u64, i64)> {
+    let open_paren = line
+        .find('(')
+        .ok_or_else(|| AppError::new(ErrorCode::ExecutionFailed, "invalid process stat format"))?;
+    let close_paren = line
+        .rfind(')')
+        .ok_or_else(|| AppError::new(ErrorCode::ExecutionFailed, "invalid process stat format"))?;
+    if close_paren <= open_paren {
+        return Err(AppError::new(
+            ErrorCode::ExecutionFailed,
+            "invalid process stat format",
+        ));
+    }
+
+    let name = line[open_paren + 1..close_paren].to_string();
+    let remainder = line[close_paren + 1..].trim();
+    let fields = remainder.split_whitespace().collect::<Vec<_>>();
+    if fields.len() <= 21 {
+        return Err(AppError::new(
+            ErrorCode::ExecutionFailed,
+            "incomplete process stat fields",
+        ));
+    }
+
+    let utime = fields[11]
+        .parse::<u64>()
+        .map_err(|_| AppError::new(ErrorCode::ExecutionFailed, "invalid process utime"))?;
+    let stime = fields[12]
+        .parse::<u64>()
+        .map_err(|_| AppError::new(ErrorCode::ExecutionFailed, "invalid process stime"))?;
+    let start_ticks = fields[19]
+        .parse::<u64>()
+        .map_err(|_| AppError::new(ErrorCode::ExecutionFailed, "invalid process start time"))?;
+    let rss_pages = fields[21]
+        .parse::<i64>()
+        .map_err(|_| AppError::new(ErrorCode::ExecutionFailed, "invalid process rss"))?;
+
+    Ok((name, utime.saturating_add(stime), start_ticks, rss_pages))
+}
+
 fn from_params<T>(value: &Value) -> AppResult<T>
 where
     T: for<'de> Deserialize<'de>,
@@ -1111,6 +1303,18 @@ fn read_uptime_seconds() -> AppResult<u64> {
     Ok(seconds)
 }
 
+fn read_uptime_seconds_precise() -> AppResult<f64> {
+    let content = fs::read_to_string("/proc/uptime")
+        .map_err(|_| AppError::new(ErrorCode::ExecutionFailed, "unable to read uptime"))?;
+    let value = content
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| AppError::new(ErrorCode::ExecutionFailed, "invalid uptime format"))?;
+    value
+        .parse::<f64>()
+        .map_err(|_| AppError::new(ErrorCode::ExecutionFailed, "invalid uptime value"))
+}
+
 fn read_load_average() -> AppResult<[f64; 3]> {
     let content = fs::read_to_string("/proc/loadavg")
         .map_err(|_| AppError::new(ErrorCode::ExecutionFailed, "unable to read load average"))?;
@@ -1170,6 +1374,63 @@ fn parse_meminfo_value(line: &str, key: &str) -> Option<u64> {
     line.strip_prefix(key)
         .and_then(|rest| rest.split_whitespace().next())
         .and_then(|value| value.parse::<u64>().ok())
+}
+
+fn read_mem_total_bytes() -> AppResult<u64> {
+    let content = fs::read_to_string("/proc/meminfo")
+        .map_err(|_| AppError::new(ErrorCode::ExecutionFailed, "unable to read meminfo"))?;
+    for line in content.lines() {
+        if let Some(value) = parse_meminfo_value(line, "MemTotal:") {
+            return Ok(value.saturating_mul(1024));
+        }
+    }
+
+    Err(AppError::new(
+        ErrorCode::ExecutionFailed,
+        "meminfo does not contain MemTotal",
+    ))
+}
+
+fn read_boot_time_unix_secs() -> AppResult<i64> {
+    let content = fs::read_to_string("/proc/stat")
+        .map_err(|_| AppError::new(ErrorCode::ExecutionFailed, "unable to read proc stat"))?;
+    for line in content.lines() {
+        if let Some(rest) = line.strip_prefix("btime ") {
+            return rest
+                .trim()
+                .parse::<i64>()
+                .map_err(|_| AppError::new(ErrorCode::ExecutionFailed, "invalid btime value"));
+        }
+    }
+
+    Err(AppError::new(
+        ErrorCode::ExecutionFailed,
+        "proc stat does not contain btime",
+    ))
+}
+
+fn clock_ticks_per_second() -> AppResult<u64> {
+    let value = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    if value <= 0 {
+        return Err(AppError::new(
+            ErrorCode::ExecutionFailed,
+            "unable to read clock tick size",
+        ));
+    }
+
+    Ok(value as u64)
+}
+
+fn page_size_bytes() -> AppResult<u64> {
+    let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if value <= 0 {
+        return Err(AppError::new(
+            ErrorCode::ExecutionFailed,
+            "unable to read page size",
+        ));
+    }
+
+    Ok(value as u64)
 }
 
 #[derive(Debug)]
@@ -1319,12 +1580,40 @@ fn now_rfc3339() -> AppResult<String> {
         .map_err(|_| AppError::new(ErrorCode::ExecutionFailed, "unable to format timestamp"))
 }
 
+fn started_at_rfc3339(
+    boot_time_unix_secs: i64,
+    start_ticks: u64,
+    clock_ticks_per_second: u64,
+) -> AppResult<String> {
+    let start_offset_nanos =
+        (start_ticks as i128).saturating_mul(1_000_000_000) / clock_ticks_per_second as i128;
+    let base_nanos = (boot_time_unix_secs as i128).saturating_mul(1_000_000_000);
+    OffsetDateTime::from_unix_timestamp_nanos(base_nanos.saturating_add(start_offset_nanos))
+        .map_err(|_| {
+            AppError::new(
+                ErrorCode::ExecutionFailed,
+                "unable to convert process start time",
+            )
+        })?
+        .format(&Rfc3339)
+        .map_err(|_| {
+            AppError::new(
+                ErrorCode::ExecutionFailed,
+                "unable to format process start time",
+            )
+        })
+}
+
 fn ratio(used: u64, total: u64) -> f64 {
     if total == 0 {
         0.0
     } else {
         used as f64 / total as f64
     }
+}
+
+fn round_percent(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
 }
 
 fn restart_mode_name(mode: &ServiceRestartMode) -> &'static str {
@@ -1617,6 +1906,31 @@ mod tests {
     }
 
     #[test]
+    fn validate_request_shape_rejects_zero_process_limit() {
+        let app = App::new(policy_for_current_user());
+        let request = Request {
+            version: 1,
+            request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62578".to_string(),
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Human,
+                id: "validator-test".to_string(),
+            },
+            action: "process.snapshot".to_string(),
+            params: serde_json::from_value(json!({
+                "top_by": "cpu",
+                "limit": 0
+            }))
+            .expect("params"),
+            dry_run: false,
+            timeout_ms: 3000,
+        };
+
+        let error = validate_request_shape(&request, &app).expect_err("process limit violation");
+        assert_eq!(error.code, ErrorCode::ValidationError);
+        assert_eq!(error.message, "process limit exceeds policy maximum");
+    }
+
+    #[test]
     fn priority_matches_filter_respects_thresholds() {
         assert!(priority_matches_filter(
             JournalPriority::Warning,
@@ -1654,6 +1968,18 @@ mod tests {
         assert_eq!(value["unit"], json!("nginx.service"));
         assert_eq!(value["priority"], json!("warning"));
         assert_eq!(value["message"], json!("upstream connection slow"));
+    }
+
+    #[test]
+    fn parse_proc_stat_line_extracts_required_fields() {
+        let line = "1234 (kworker/0:1) S 1 2 3 4 5 6 7 8 9 10 120 30 14 15 16 17 18 19 1900 2000 400 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0";
+        let (name, total_cpu_ticks, start_ticks, rss_pages) =
+            parse_proc_stat_line(line).expect("parse proc stat");
+
+        assert_eq!(name, "kworker/0:1");
+        assert_eq!(total_cpu_ticks, 150);
+        assert_eq!(start_ticks, 1900);
+        assert_eq!(rss_pages, 400);
     }
 
     fn policy_for_current_user() -> PolicyEngine {
