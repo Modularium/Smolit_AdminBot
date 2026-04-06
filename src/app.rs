@@ -70,7 +70,7 @@ impl App {
         let mutation_limiter = MutationLimiter::new(policy.constraints().max_parallel_mutations);
         Self {
             policy,
-            audit: AuditLogger,
+            audit: AuditLogger::default(),
             mutation_limiter,
         }
     }
@@ -80,7 +80,6 @@ impl App {
     }
 
     pub fn handle_request(&self, request: Request, peer: PeerCredentials) -> Response {
-        self.audit.log_received(&request, &peer);
         match self.execute(&request, &peer) {
             Ok(result) => {
                 self.audit.log_success(&request, &peer);
@@ -97,6 +96,7 @@ impl App {
         let metadata = actions::validate_request_shape(request, self)?;
         self.policy.authorize(request, &metadata, peer)?;
         let _mutation_permit = self.try_acquire_mutation_permit(request, &metadata)?;
+        self.audit.log_received(request, peer);
         actions::execute(self, request)
     }
 

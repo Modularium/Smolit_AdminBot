@@ -77,8 +77,9 @@
 [x] Peer UID, GID und PID werden geloggt
 [x] Policy- und Capability-Entscheidungen werden geloggt
 [x] stderr-Fallback fuer Audit existiert
+[x] repetitive Boundary-Fehler (`validation_error`, `unsupported_version`, `unauthorized`, `forbidden`) werden pro Peer/Action mit Burst-Limit `4 / 1000 ms` auditseitig gedrosselt; ein Suppressionsmarker wird einmalig emittiert
 [ ] Aufbewahrung und Integritaet der Audit-Daten betrieblich definieren
-[ ] Audit-Flooding und Log-Rotation bewerten
+[x] Audit-Flooding fuer repetitive invalide Requests ist mit deterministischem Drosselungsfenster bewertet und technisch begrenzt
 [ ] sensible Inhalte in Audit und `journal.query` auf Redaktionsbedarf pruefen
 
 ## polkit und Systemintegration
