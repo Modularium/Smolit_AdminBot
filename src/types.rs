@@ -36,21 +36,21 @@ impl Request {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SuccessResponse {
     pub request_id: String,
     pub status: &'static str,
     pub result: Value,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ErrorResponse {
     pub request_id: String,
     pub status: &'static str,
     pub error: ErrorBody,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum Response {
     Success(SuccessResponse),

@@ -56,6 +56,7 @@
 [ ] Policy-Integritaet oder Change-Control dokumentieren
 [x] `allowed_request_types` nicht mehr fuer Autorisierung verwenden; getrennte Unix-User oder -Gruppen fuer getrennte Rollen erzwingen
 [x] `max_parallel_mutations` aktiv technisch erzwingen; mutierende Non-Dry-Run-Requests werden ueber dem Policy-Limit fail-fast mit `rate_limited` abgewiesen
+[x] mutierende Non-Dry-Run-Requests binden `request_id` peer-gebunden fuer `300 s`; identische Replays liefern denselben Response, mismatched Reuse wird abgewiesen
 
 ## Action- und Backend-Sicherheit
 

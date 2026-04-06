@@ -1,6 +1,6 @@
+use std::collections::HashMap;
 use std::sync::Mutex;
-
-use serde_json::Value;
+use std::time::{Duration, Instant};
 
 use crate::actions::{self, ActionHandler, ActionMetadata};
 use crate::audit::AuditLogger;
@@ -8,6 +8,8 @@ use crate::error::{AppError, ErrorCode};
 use crate::peer::PeerCredentials;
 use crate::policy::PolicyEngine;
 use crate::types::{Request, Response};
+
+pub const MUTATING_REQUEST_REPLAY_WINDOW: Duration = Duration::from_secs(300);
 
 #[derive(Debug)]
 struct MutationLimiter {
@@ -21,10 +23,48 @@ struct MutationPermit<'a> {
 }
 
 #[derive(Debug)]
+struct ReplayProtector {
+    entries: Mutex<HashMap<ReplayKey, ReplayEntry>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ReplayKey {
+    peer_uid: u32,
+    peer_gid: u32,
+    request_id: String,
+}
+
+#[derive(Debug)]
+enum ReplayEntry {
+    InFlight {
+        fingerprint: Vec<u8>,
+        started_at: Instant,
+    },
+    Completed {
+        fingerprint: Vec<u8>,
+        response: Response,
+        completed_at: Instant,
+    },
+}
+
+#[derive(Debug)]
+enum ReplayDecision {
+    Execute(ReplayReservation),
+    ReturnCached(Response),
+}
+
+#[derive(Debug)]
+struct ReplayReservation {
+    key: ReplayKey,
+    fingerprint: Vec<u8>,
+}
+
+#[derive(Debug)]
 pub struct App {
     policy: PolicyEngine,
     audit: AuditLogger,
     mutation_limiter: MutationLimiter,
+    replay_protector: ReplayProtector,
 }
 
 impl MutationLimiter {
@@ -65,6 +105,118 @@ impl Drop for MutationPermit<'_> {
     }
 }
 
+impl Default for ReplayProtector {
+    fn default() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl ReplayProtector {
+    fn begin(&self, request: &Request, peer: &PeerCredentials) -> Result<ReplayDecision, AppError> {
+        let key = ReplayKey {
+            peer_uid: peer.uid,
+            peer_gid: peer.gid,
+            request_id: request.request_id.clone(),
+        };
+        let fingerprint = replay_fingerprint(request)?;
+        let now = Instant::now();
+
+        let mut guard = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.retain(|_, entry| !entry.is_expired(now));
+
+        match guard.get(&key) {
+            Some(ReplayEntry::InFlight {
+                fingerprint: existing,
+                ..
+            }) => {
+                if *existing == fingerprint {
+                    return Err(AppError::new(
+                        ErrorCode::RateLimited,
+                        "mutating request replay is already in progress",
+                    )
+                    .with_detail("request_id", request.request_id.clone())
+                    .with_detail(
+                        "replay_window_ms",
+                        MUTATING_REQUEST_REPLAY_WINDOW.as_millis() as u64,
+                    )
+                    .retryable(true));
+                }
+
+                return Err(replay_mismatch_error(request));
+            }
+            Some(ReplayEntry::Completed {
+                fingerprint: existing,
+                response,
+                ..
+            }) => {
+                if *existing == fingerprint {
+                    return Ok(ReplayDecision::ReturnCached(response.clone()));
+                }
+
+                return Err(replay_mismatch_error(request));
+            }
+            None => {}
+        }
+
+        guard.insert(
+            key.clone(),
+            ReplayEntry::InFlight {
+                fingerprint: fingerprint.clone(),
+                started_at: now,
+            },
+        );
+
+        Ok(ReplayDecision::Execute(ReplayReservation {
+            key,
+            fingerprint,
+        }))
+    }
+
+    fn abort(&self, reservation: &ReplayReservation) {
+        let mut guard = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let should_remove = matches!(
+            guard.get(&reservation.key),
+            Some(ReplayEntry::InFlight { fingerprint, .. }) if *fingerprint == reservation.fingerprint
+        );
+        if should_remove {
+            guard.remove(&reservation.key);
+        }
+    }
+
+    fn complete(&self, reservation: ReplayReservation, response: &Response) {
+        let mut guard = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard.insert(
+            reservation.key,
+            ReplayEntry::Completed {
+                fingerprint: reservation.fingerprint,
+                response: response.clone(),
+                completed_at: Instant::now(),
+            },
+        );
+    }
+}
+
+impl ReplayEntry {
+    fn is_expired(&self, now: Instant) -> bool {
+        let timestamp = match self {
+            ReplayEntry::InFlight { started_at, .. } => *started_at,
+            ReplayEntry::Completed { completed_at, .. } => *completed_at,
+        };
+        now.duration_since(timestamp) >= MUTATING_REQUEST_REPLAY_WINDOW
+    }
+}
+
 impl App {
     pub fn new(policy: PolicyEngine) -> Self {
         let mutation_limiter = MutationLimiter::new(policy.constraints().max_parallel_mutations);
@@ -72,6 +224,7 @@ impl App {
             policy,
             audit: AuditLogger::default(),
             mutation_limiter,
+            replay_protector: ReplayProtector::default(),
         }
     }
 
@@ -81,9 +234,9 @@ impl App {
 
     pub fn handle_request(&self, request: Request, peer: PeerCredentials) -> Response {
         match self.execute(&request, &peer) {
-            Ok(result) => {
-                self.audit.log_success(&request, &peer);
-                Response::success(request.request_id, result)
+            Ok(response) => {
+                self.log_response(&request, &peer, &response);
+                response
             }
             Err(error) => {
                 self.audit.log_error(&request, &peer, &error);
@@ -92,12 +245,17 @@ impl App {
         }
     }
 
-    fn execute(&self, request: &Request, peer: &PeerCredentials) -> Result<Value, AppError> {
+    fn execute(&self, request: &Request, peer: &PeerCredentials) -> Result<Response, AppError> {
         let metadata = actions::validate_request_shape(request, self)?;
         self.policy.authorize(request, &metadata, peer)?;
-        let _mutation_permit = self.try_acquire_mutation_permit(request, &metadata)?;
+
+        if requires_mutation_permit(request, &metadata) {
+            return self.execute_mutating_request(request, peer, &metadata);
+        }
+
         self.audit.log_received(request, peer);
         actions::execute(self, request)
+            .map(|result| Response::success(request.request_id.clone(), result))
     }
 
     fn try_acquire_mutation_permit<'a>(
@@ -116,10 +274,89 @@ impl App {
     fn hold_mutation_slot_for_test(&self) -> Result<MutationPermit<'_>, AppError> {
         self.mutation_limiter.try_acquire()
     }
+
+    fn execute_mutating_request(
+        &self,
+        request: &Request,
+        peer: &PeerCredentials,
+        metadata: &ActionMetadata,
+    ) -> Result<Response, AppError> {
+        let reservation = match self.replay_protector.begin(request, peer)? {
+            ReplayDecision::ReturnCached(response) => return Ok(response),
+            ReplayDecision::Execute(reservation) => reservation,
+        };
+
+        let _mutation_permit = match self.try_acquire_mutation_permit(request, metadata) {
+            Ok(Some(permit)) => permit,
+            Ok(None) => {
+                self.replay_protector.abort(&reservation);
+                return Err(AppError::new(
+                    ErrorCode::ExecutionFailed,
+                    "mutation replay guard expected a mutation permit",
+                ));
+            }
+            Err(error) => {
+                self.replay_protector.abort(&reservation);
+                return Err(error);
+            }
+        };
+
+        self.audit.log_received(request, peer);
+        match actions::execute(self, request) {
+            Ok(result) => {
+                let response = Response::success(request.request_id.clone(), result);
+                self.replay_protector.complete(reservation, &response);
+                Ok(response)
+            }
+            Err(error) => {
+                let response = Response::error(request.request_id.clone(), error.to_body());
+                self.replay_protector.complete(reservation, &response);
+                Err(error)
+            }
+        }
+    }
+
+    fn log_response(&self, request: &Request, peer: &PeerCredentials, response: &Response) {
+        match response {
+            Response::Success(_) => self.audit.log_success(request, peer),
+            Response::Error(error) => self.audit.log_error(
+                request,
+                peer,
+                &AppError {
+                    code: error.error.code,
+                    message: error.error.message.clone(),
+                    details: error.error.details.clone(),
+                    retryable: error.error.retryable,
+                },
+            ),
+        }
+    }
 }
 
 fn requires_mutation_permit(request: &Request, metadata: &ActionMetadata) -> bool {
     !request.dry_run && matches!(metadata.handler, ActionHandler::ServiceRestart)
+}
+
+fn replay_fingerprint(request: &Request) -> Result<Vec<u8>, AppError> {
+    serde_json::to_vec(request).map_err(|error| {
+        AppError::new(
+            ErrorCode::ExecutionFailed,
+            "unable to encode mutating request fingerprint",
+        )
+        .with_detail("source", error.to_string())
+    })
+}
+
+fn replay_mismatch_error(request: &Request) -> AppError {
+    AppError::new(
+        ErrorCode::ValidationError,
+        "request_id is already bound to a different mutating request",
+    )
+    .with_detail("request_id", request.request_id.clone())
+    .with_detail(
+        "replay_window_ms",
+        MUTATING_REQUEST_REPLAY_WINDOW.as_millis() as u64,
+    )
 }
 
 #[cfg(test)]
@@ -312,6 +549,78 @@ max_restarts_per_hour = 3
             }
             Response::Success(success) => panic!("unexpected success response: {:?}", success),
         }
+    }
+
+    #[test]
+    fn completed_mutating_replay_returns_cached_response() {
+        let unit = "adminbot-missing-replay.service";
+        let app = App::new(service_restart_policy_for_current_user(unit));
+        let request = service_restart_request(unit, false);
+
+        let first = app.handle_request(request.clone(), current_peer());
+        let _permit = app
+            .hold_mutation_slot_for_test()
+            .expect("hold mutation slot after first response");
+        let second = app.handle_request(request, current_peer());
+
+        assert_eq!(
+            serde_json::to_value(&first).expect("serialize first"),
+            serde_json::to_value(&second).expect("serialize second")
+        );
+    }
+
+    #[test]
+    fn mutating_request_id_reuse_with_different_payload_is_rejected() {
+        let app = App::new(service_restart_policy_for_current_user_list(&[
+            "adminbot-first-missing.service",
+            "adminbot-second-missing.service",
+        ]));
+        let first = service_restart_request("adminbot-first-missing.service", false);
+        let second = service_restart_request_with_id(
+            "adminbot-second-missing.service",
+            false,
+            &first.request_id,
+        );
+
+        let _ = app.handle_request(first, current_peer());
+        let response = app.handle_request(second, current_peer());
+
+        match response {
+            Response::Error(error) => {
+                assert_eq!(error.error.code, crate::error::ErrorCode::ValidationError);
+                assert_eq!(
+                    error.error.message,
+                    "request_id is already bound to a different mutating request"
+                );
+                assert_eq!(
+                    error.error.details.get("request_id"),
+                    Some(&json!("2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62572"))
+                );
+            }
+            Response::Success(success) => panic!("unexpected success response: {:?}", success),
+        }
+    }
+
+    #[test]
+    fn in_flight_mutating_replay_is_retryable_rate_limited() {
+        let protector = ReplayProtector::default();
+        let peer = current_peer();
+        let request = service_restart_request("adminbot-inflight-missing.service", false);
+
+        let _reservation = match protector.begin(&request, &peer).expect("begin first") {
+            ReplayDecision::Execute(reservation) => reservation,
+            ReplayDecision::ReturnCached(_) => panic!("first request must not be cached"),
+        };
+
+        let error = protector
+            .begin(&request, &peer)
+            .expect_err("in-flight duplicate must fail");
+        assert_eq!(error.code, crate::error::ErrorCode::RateLimited);
+        assert_eq!(
+            error.message,
+            "mutating request replay is already in progress"
+        );
+        assert_eq!(error.retryable, true);
     }
 
     #[test]
@@ -993,10 +1302,26 @@ process_limit_max = 10
         service_restart_policy_with_parallel_limit(unit, 1)
     }
 
+    fn service_restart_policy_for_current_user_list(units: &[&str]) -> PolicyEngine {
+        service_restart_policy_with_parallel_limit_list(units, 1)
+    }
+
     fn service_restart_policy_with_parallel_limit(
         unit: &str,
         max_parallel_mutations: u32,
     ) -> PolicyEngine {
+        service_restart_policy_with_parallel_limit_list(&[unit], max_parallel_mutations)
+    }
+
+    fn service_restart_policy_with_parallel_limit_list(
+        units: &[&str],
+        max_parallel_mutations: u32,
+    ) -> PolicyEngine {
+        let allowed_units = units
+            .iter()
+            .map(|unit| format!("\"{unit}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
         let template = format!(
             r#"
 version = 1
@@ -1010,7 +1335,7 @@ allowed = ["service.restart"]
 denied = []
 
 [service_control]
-allowed_units = ["{unit}"]
+allowed_units = [{allowed_units}]
 restart_cooldown_seconds = 300
 max_restarts_per_hour = 3
 
@@ -1023,9 +1348,13 @@ max_parallel_mutations = {max_parallel_mutations}
     }
 
     fn service_restart_request(unit: &str, dry_run: bool) -> Request {
+        service_restart_request_with_id(unit, dry_run, "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62572")
+    }
+
+    fn service_restart_request_with_id(unit: &str, dry_run: bool, request_id: &str) -> Request {
         Request {
             version: 1,
-            request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62572".to_string(),
+            request_id: request_id.to_string(),
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "test-cli".to_string(),
