@@ -239,6 +239,37 @@ mod tests {
         let _ = fs::remove_file(policy_path);
     }
 
+    #[test]
+    fn run_once_maps_invalid_json_to_validation_error_response() {
+        let socket_path = temp_socket_path("invalid-json");
+        let policy_path = temp_policy_path();
+        let policy = PolicyEngine::load_from_path(policy_path.clone()).expect("policy");
+        let app = App::new(policy);
+        let server = IpcServer::bind_for_test(socket_path.clone()).expect("bind");
+
+        let handle = thread::spawn(move || server.run_once(&app));
+
+        let mut client = connect_with_retry(&socket_path);
+        let payload = br#"{"version":1,"request_id":"broken""#.to_vec();
+        write_raw_frame(&mut client, &payload);
+
+        let response_payload = read_frame(&mut client).expect("read response");
+        let response: serde_json::Value =
+            serde_json::from_slice(&response_payload).expect("decode response");
+        assert_eq!(
+            response["request_id"],
+            "00000000-0000-0000-0000-000000000000"
+        );
+        assert_eq!(response["status"], "error");
+        assert_eq!(response["error"]["code"], "validation_error");
+        assert_eq!(response["error"]["message"], "invalid request payload");
+        assert!(response["error"]["details"]["source"].is_string());
+        assert_eq!(response["error"]["retryable"], false);
+
+        handle.join().expect("join").expect("server run_once");
+        let _ = fs::remove_file(policy_path);
+    }
+
     fn temp_socket_path(name: &str) -> PathBuf {
         let mut path = env::temp_dir();
         let nanos = SystemTime::now()
@@ -275,5 +306,13 @@ mod tests {
                 Err(error) => panic!("connect failed: {error}"),
             }
         }
+    }
+
+    fn write_raw_frame(stream: &mut UnixStream, payload: &[u8]) {
+        stream
+            .write_all(&(payload.len() as u32).to_be_bytes())
+            .expect("write length");
+        stream.write_all(payload).expect("write payload");
+        stream.flush().expect("flush");
     }
 }
