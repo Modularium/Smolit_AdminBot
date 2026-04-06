@@ -75,6 +75,7 @@ Nachteile:
 
 - zusätzliche Integrationsarbeit
 - polkit-Regeln müssen sauber und eng formuliert werden
+- die Systemaktion ist grober als AdminBot selbst und muss deshalb durch lokale Policy und feste D-Bus-Semantik nachgeschaerft werden
 
 Entscheidung:
 
@@ -85,6 +86,8 @@ Entscheidung:
   - systemd-Mode nur `"replace"`
   - AdminBot-Mode nur `safe`
   - Mapping `safe -> RestartUnit(unit, "replace")`
+  - polkit-Aktions-ID `org.freedesktop.systemd1.manage-units`
+  - versionierte polkit-Regelvorlage im Repository unter `deploy/polkit/50-adminbotd-systemd.rules`
 - nicht Teil von `v1`:
   - kein `systemctl`
   - kein Shell-Fallback
@@ -437,6 +440,7 @@ Für `agent`-Requests zusätzlich sinnvoll:
 - `Agent-NN` bekommt keinen Shell-Bypass
 - `AdminBot` prüft lokal jede Anfrage
 - polkit ist keine Agent-NN-Eskalationsfläche, sondern nur eine schmale Systembrücke für den Service-Control-Pfad
+- die polkit-Vorlage darf nur den Service-User `adminbot` zulassen; Endnutzer bleiben auf die lokale IPC-Grenze beschränkt
 
 ### Konkrete Grenze
 

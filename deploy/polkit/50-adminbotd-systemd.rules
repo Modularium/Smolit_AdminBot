@@ -1,0 +1,20 @@
+// AdminBot v2 polkit rule template for the systemd service-control bridge.
+//
+// Purpose:
+// - allow the adminbotd service user to call the narrow systemd polkit action
+//   required for RestartUnit() over the system bus
+//
+// Security boundaries:
+// - this rule only opens the system privilege bridge
+// - AdminBot policy, unit allowlist, cooldown and rate-limit remain mandatory
+// - this rule must not be broadened to arbitrary identities
+//
+// Install target:
+// - /etc/polkit-1/rules.d/50-adminbotd-systemd.rules
+
+polkit.addRule(function(action, subject) {
+    if (action.id === "org.freedesktop.systemd1.manage-units" &&
+        subject.user === "adminbot") {
+        return polkit.Result.YES;
+    }
+});

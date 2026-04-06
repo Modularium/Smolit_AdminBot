@@ -35,6 +35,14 @@ Die Beispielpolicy ist bewusst konservativ und gibt dem lokalen Beispielclient n
 
 `adminbotd` startet fail closed, wenn `/etc/adminbot/policy.toml` nicht root-owned ist oder group-/world-writable bleibt.
 
+## polkit-Artefakt
+
+Die versionierte polkit-Regelvorlage fuer den `service.restart`-Pfad liegt unter:
+
+- `deploy/polkit/50-adminbotd-systemd.rules`
+
+Sie ist bewusst nur fuer den Service-User `adminbot` ausgelegt und oeffnet ausschliesslich die systemd-Aktion `org.freedesktop.systemd1.manage-units`. Die fachliche Freigabe bleibt in AdminBot-Policy und Code.
+
 Wichtig fuer `v1.x`:
 
 - Autorisierung folgt echten lokalen Peer-Credentials (`SO_PEERCRED`, Unix-User, Unix-Gruppen)

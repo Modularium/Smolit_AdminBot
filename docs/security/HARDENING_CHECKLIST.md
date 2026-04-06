@@ -81,7 +81,7 @@
 
 ## polkit und Systemintegration
 
-[ ] polkit-Regeln als versioniertes Betriebsartefakt dokumentieren
+[x] polkit-Regeln als versioniertes Betriebsartefakt dokumentieren
 [ ] polkit-Regeln auf minimale Identitaeten und minimale Aktionen verengen
 [ ] sicherstellen, dass polkit nicht mehr erlaubt als die lokale Policy
 [ ] Zielsystem-Validierung nach jeder relevanten Härtungsanpassung wiederholen

@@ -57,7 +57,7 @@ Dieses Dokument haelt die sicherheitsrelevanten Entscheidungen fuer die Nachhaer
 
 - Prioritaet: `P0`
 - GitHub-Issue: `#77`
-- Entscheidung: polkit-Regeln werden versioniert, dokumentiert und als Teil des Security-Reviews behandelt.
+- Entscheidung: polkit-Regeln werden versioniert, dokumentiert und als Teil des Security-Reviews behandelt. Die v1.x-Vorlage erlaubt nur `org.freedesktop.systemd1.manage-units` fuer den Service-User `adminbot`.
 - Begruendung: die D-Bus/polkit-Bruecke ist die reale Privileggrenze fuer mutierende Service-Aktionen.
 - Nicht Ziel: Ersatz von polkit durch eigene Privilegmechanismen.
 
