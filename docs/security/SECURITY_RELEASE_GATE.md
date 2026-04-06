@@ -28,6 +28,16 @@ Aufruf:
 bash scripts/verify_security_release_gate.sh --mode artifact
 ```
 
+CI-Erzwingung:
+
+- GitHub Actions Workflow: `.github/workflows/security-gate.yml`
+- Trigger:
+  - jeder `pull_request`
+  - jeder Push auf `dev`
+  - jeder Push auf `main`
+- der Workflow fuehrt verpflichtend `bash scripts/verify_security_release_gate.sh --mode artifact` aus
+- ein `FAIL` im Gate macht den Workflow und damit den Build rot
+
 ### `live`
 
 Zielsystem-Modus.
@@ -112,6 +122,18 @@ Ein Release gilt erst dann als sicher freigabefaehig, wenn beide Stufen erfolgre
 
 1. `artifact`-Gate gegen die versionierten Repo-Artefakte
 2. `live`-Gate auf dem Zielsystem oder im finalen Deployment-Abbild
+
+## CI Integration
+
+Der Repository-Check ist nicht nur lokal verfuegbar, sondern wird zentral ueber GitHub Actions erzwungen.
+
+- Pflicht-Job: `security-gate`
+- Script: `bash scripts/verify_security_release_gate.sh --mode artifact`
+- Wirkung:
+  - Pull Requests muessen das Gate bestehen, bevor sie als sicher reviewbar gelten
+  - Pushes auf `dev` und `main` schlagen sichtbar fehl, wenn Policy-, polkit- oder Hardening-Artefakte driften
+
+Der CI-Job ersetzt den `live`-Check nicht. Er stellt nur sicher, dass versionierte Security-Artefakte nicht stillschweigend regressieren.
 
 Der Gate-Check ersetzt nicht:
 

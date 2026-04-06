@@ -1,0 +1,23 @@
+name: Security Gate
+
+on:
+  pull_request:
+  push:
+    branches:
+      - dev
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  security-gate:
+    name: security-gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify security release gate artifacts
+        shell: bash
+        run: bash scripts/verify_security_release_gate.sh --mode artifact

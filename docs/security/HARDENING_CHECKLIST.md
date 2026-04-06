@@ -94,4 +94,5 @@
 [x] lokaler Testbestand fuer Validierung und Policy ist vorhanden
 [x] Integrationstest fuer echten Restart-Pfad existiert als opt-in ignored test
 [x] Security-Release-Gate-Script fuer Repo-Artefakte und Live-Deployment ist vorhanden
+[x] GitHub Actions erzwingt das `artifact`-Security-Gate fuer Pull Requests sowie Pushes auf `dev` und `main`
 [ ] manuelle Zielsystem-Pruefung fuer Hardening regelmaessig wiederholen
