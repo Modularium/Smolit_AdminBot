@@ -1,0 +1,23 @@
+[Unit]
+Description=AdminBot v2 Local Administration Daemon
+After=local-fs.target
+
+[Service]
+Type=simple
+User=adminbot
+Group=adminbot
+SupplementaryGroups=adminbotctl
+RuntimeDirectory=adminbot
+RuntimeDirectoryMode=0750
+StateDirectory=adminbot
+WorkingDirectory=/var/lib/adminbot
+ExecStart=/usr/local/bin/adminbotd
+Restart=on-failure
+RestartSec=5
+
+# v1 fixed paths from docs/adminbot_v2/*
+# - policy: /etc/adminbot/policy.toml
+# - socket: /run/adminbot/adminbot.sock
+
+[Install]
+WantedBy=multi-user.target
