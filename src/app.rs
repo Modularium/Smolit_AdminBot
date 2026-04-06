@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,45 @@ struct MutationLimiter {
 #[derive(Debug)]
 struct MutationPermit<'a> {
     limiter: &'a MutationLimiter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestClass {
+    Read,
+    Mutate,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RateLimitConfig {
+    window: Duration,
+    per_peer_limit: usize,
+    global_limit: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PeerRateKey {
+    uid: u32,
+    gid: u32,
+}
+
+#[derive(Debug, Default)]
+struct RateLimitWindow {
+    hits: VecDeque<Instant>,
+}
+
+#[derive(Debug, Default)]
+struct RequestRateLimiterState {
+    global_read: RateLimitWindow,
+    global_mutate: RateLimitWindow,
+    per_peer_read: HashMap<PeerRateKey, RateLimitWindow>,
+    per_peer_mutate: HashMap<PeerRateKey, RateLimitWindow>,
+}
+
+#[derive(Debug)]
+struct RequestRateLimiter {
+    read: RateLimitConfig,
+    mutate: RateLimitConfig,
+    state: Mutex<RequestRateLimiterState>,
 }
 
 #[derive(Debug)]
@@ -63,6 +102,7 @@ struct ReplayReservation {
 pub struct App {
     policy: PolicyEngine,
     audit: AuditLogger,
+    request_rate_limiter: RequestRateLimiter,
     mutation_limiter: MutationLimiter,
     replay_protector: ReplayProtector,
 }
@@ -102,6 +142,62 @@ impl Drop for MutationPermit<'_> {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *active = active.saturating_sub(1);
+    }
+}
+
+impl RequestRateLimiter {
+    fn from_policy(policy: &PolicyEngine) -> Self {
+        let constraints = policy.constraints();
+        Self {
+            read: RateLimitConfig {
+                window: Duration::from_millis(constraints.read_rate_limit_window_ms.max(1)),
+                per_peer_limit: constraints.read_requests_per_peer_per_window.max(1) as usize,
+                global_limit: constraints.global_read_requests_per_window.max(1) as usize,
+            },
+            mutate: RateLimitConfig {
+                window: Duration::from_millis(constraints.mutate_rate_limit_window_ms.max(1)),
+                per_peer_limit: constraints.mutate_requests_per_peer_per_window.max(1) as usize,
+                global_limit: constraints.global_mutate_requests_per_window.max(1) as usize,
+            },
+            state: Mutex::new(RequestRateLimiterState::default()),
+        }
+    }
+
+    fn check(&self, request_class: RequestClass, peer: &PeerCredentials) -> Result<(), AppError> {
+        let now = Instant::now();
+        let key = PeerRateKey {
+            uid: peer.uid,
+            gid: peer.gid,
+        };
+
+        let mut guard = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match request_class {
+            RequestClass::Read => {
+                let state = &mut *guard;
+                apply_rate_limit(
+                    &mut state.global_read,
+                    &mut state.per_peer_read,
+                    self.read,
+                    request_class,
+                    key,
+                    now,
+                )
+            }
+            RequestClass::Mutate => {
+                let state = &mut *guard;
+                apply_rate_limit(
+                    &mut state.global_mutate,
+                    &mut state.per_peer_mutate,
+                    self.mutate,
+                    request_class,
+                    key,
+                    now,
+                )
+            }
+        }
     }
 }
 
@@ -219,10 +315,12 @@ impl ReplayEntry {
 
 impl App {
     pub fn new(policy: PolicyEngine) -> Self {
+        let request_rate_limiter = RequestRateLimiter::from_policy(&policy);
         let mutation_limiter = MutationLimiter::new(policy.constraints().max_parallel_mutations);
         Self {
             policy,
             audit: AuditLogger::default(),
+            request_rate_limiter,
             mutation_limiter,
             replay_protector: ReplayProtector::default(),
         }
@@ -247,6 +345,8 @@ impl App {
 
     fn execute(&self, request: &Request, peer: &PeerCredentials) -> Result<Response, AppError> {
         let metadata = actions::validate_request_shape(request, self)?;
+        self.request_rate_limiter
+            .check(classify_request(request, &metadata), peer)?;
         self.policy.authorize(request, &metadata, peer)?;
 
         if requires_mutation_permit(request, &metadata) {
@@ -333,6 +433,78 @@ impl App {
     }
 }
 
+fn classify_request(request: &Request, metadata: &ActionMetadata) -> RequestClass {
+    if requires_mutation_permit(request, metadata) {
+        RequestClass::Mutate
+    } else {
+        RequestClass::Read
+    }
+}
+
+fn retain_recent_hits(hits: &mut VecDeque<Instant>, window: Duration, now: Instant) {
+    while let Some(oldest) = hits.front().copied() {
+        if now.duration_since(oldest) < window {
+            break;
+        }
+        hits.pop_front();
+    }
+}
+
+fn apply_rate_limit(
+    global_window: &mut RateLimitWindow,
+    per_peer_windows: &mut HashMap<PeerRateKey, RateLimitWindow>,
+    config: RateLimitConfig,
+    request_class: RequestClass,
+    key: PeerRateKey,
+    now: Instant,
+) -> Result<(), AppError> {
+    retain_recent_hits(&mut global_window.hits, config.window, now);
+    if global_window.hits.len() >= config.global_limit {
+        return Err(rate_limit_error(
+            request_class,
+            "global",
+            config.global_limit,
+            config.window,
+        ));
+    }
+
+    let peer_window = per_peer_windows.entry(key).or_default();
+    retain_recent_hits(&mut peer_window.hits, config.window, now);
+    if peer_window.hits.len() >= config.per_peer_limit {
+        return Err(rate_limit_error(
+            request_class,
+            "per_peer",
+            config.per_peer_limit,
+            config.window,
+        ));
+    }
+
+    global_window.hits.push_back(now);
+    peer_window.hits.push_back(now);
+    per_peer_windows.retain(|_, window| !window.hits.is_empty());
+    Ok(())
+}
+
+fn rate_limit_error(
+    request_class: RequestClass,
+    scope: &'static str,
+    limit: usize,
+    window: Duration,
+) -> AppError {
+    AppError::new(ErrorCode::RateLimited, "request rate limit exceeded")
+        .with_detail(
+            "request_class",
+            match request_class {
+                RequestClass::Read => "read",
+                RequestClass::Mutate => "mutate",
+            },
+        )
+        .with_detail("scope", scope)
+        .with_detail("limit", limit as u64)
+        .with_detail("window_ms", window.as_millis() as u64)
+        .retryable(true)
+}
+
 fn requires_mutation_permit(request: &Request, metadata: &ActionMetadata) -> bool {
     !request.dry_run && matches!(metadata.handler, ActionHandler::ServiceRestart)
 }
@@ -409,6 +581,98 @@ denied = []
                 assert!(success.result.get("hostname").is_some());
             }
             Response::Error(error) => panic!("unexpected error response: {:?}", error),
+        }
+    }
+
+    #[test]
+    fn read_requests_are_rate_limited_per_peer() {
+        let app = App::new(policy_for_current_user(
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "__USER__"
+allowed_capabilities = ["read_basic"]
+
+[actions]
+allowed = ["system.status"]
+denied = []
+
+[constraints]
+read_rate_limit_window_ms = 60000
+read_requests_per_peer_per_window = 2
+global_read_requests_per_window = 10
+"#,
+        ));
+
+        let first = app.handle_request(
+            system_status_request("2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62593"),
+            current_peer(),
+        );
+        let second = app.handle_request(
+            system_status_request("2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62594"),
+            current_peer(),
+        );
+        let third = app.handle_request(
+            system_status_request("2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62595"),
+            current_peer(),
+        );
+
+        assert!(matches!(first, Response::Success(_)));
+        assert!(matches!(second, Response::Success(_)));
+        match third {
+            Response::Error(error) => {
+                assert_eq!(error.error.code.to_string(), "rate_limited");
+                assert_eq!(error.error.details.get("request_class"), Some(&json!("read")));
+                assert_eq!(error.error.details.get("scope"), Some(&json!("per_peer")));
+            }
+            Response::Success(success) => panic!("unexpected success response: {:?}", success),
+        }
+    }
+
+    #[test]
+    fn read_requests_are_rate_limited_globally_across_peers() {
+        let app = App::new(policy_for_current_user(
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "__USER__"
+allowed_capabilities = ["read_basic"]
+
+[actions]
+allowed = ["system.status"]
+denied = []
+
+[constraints]
+read_rate_limit_window_ms = 60000
+read_requests_per_peer_per_window = 10
+global_read_requests_per_window = 2
+"#,
+        ));
+
+        let first = app.handle_request(
+            system_status_request("2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62596"),
+            current_peer(),
+        );
+        let second = app.handle_request(
+            system_status_request("2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62597"),
+            peer_with_ids(4242, 2424),
+        );
+        let third = app.handle_request(
+            system_status_request("2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62598"),
+            peer_with_ids(4343, 3434),
+        );
+
+        assert!(matches!(first, Response::Success(_)));
+        assert!(matches!(second, Response::Success(_)));
+        match third {
+            Response::Error(error) => {
+                assert_eq!(error.error.code.to_string(), "rate_limited");
+                assert_eq!(error.error.details.get("request_class"), Some(&json!("read")));
+                assert_eq!(error.error.details.get("scope"), Some(&json!("global")));
+            }
+            Response::Success(success) => panic!("unexpected success response: {:?}", success),
         }
     }
 
@@ -546,6 +810,120 @@ max_restarts_per_hour = 3
                     Some(&json!(1))
                 );
                 assert_eq!(error.error.retryable, true);
+            }
+            Response::Success(success) => panic!("unexpected success response: {:?}", success),
+        }
+    }
+
+    #[test]
+    fn mutating_requests_are_rate_limited_per_peer() {
+        let unit = "adminbot-rate-limit-mutate.service";
+        let app = App::new(policy_for_current_user(&format!(
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "__USER__"
+allowed_capabilities = ["service_control"]
+
+[actions]
+allowed = ["service.restart"]
+denied = []
+
+[service_control]
+allowed_units = ["{unit}", "adminbot-rate-limit-mutate-2.service"]
+restart_cooldown_seconds = 0
+max_restarts_per_hour = 10
+
+[constraints]
+mutate_rate_limit_window_ms = 60000
+mutate_requests_per_peer_per_window = 1
+global_mutate_requests_per_window = 10
+"#
+        )));
+
+        let first = app.handle_request(service_restart_request(unit, false), current_peer());
+        let second = app.handle_request(
+            service_restart_request_with_id(
+                "adminbot-rate-limit-mutate-2.service",
+                false,
+                "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62590",
+            ),
+            current_peer(),
+        );
+
+        assert!(matches!(first, Response::Error(_)));
+        match second {
+            Response::Error(error) => {
+                assert_eq!(error.error.code.to_string(), "rate_limited");
+                assert_eq!(error.error.details.get("request_class"), Some(&json!("mutate")));
+                assert_eq!(error.error.details.get("scope"), Some(&json!("per_peer")));
+            }
+            Response::Success(success) => panic!("unexpected success response: {:?}", success),
+        }
+    }
+
+    #[test]
+    fn mutating_requests_are_rate_limited_globally_across_peers() {
+        let units = [
+            "adminbot-rate-limit-global-1.service",
+            "adminbot-rate-limit-global-2.service",
+            "adminbot-rate-limit-global-3.service",
+        ];
+        let allowed_units = units
+            .iter()
+            .map(|unit| format!("\"{unit}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let app = App::new(policy_for_current_user(&format!(
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "__USER__"
+allowed_capabilities = ["service_control"]
+
+[actions]
+allowed = ["service.restart"]
+denied = []
+
+[service_control]
+allowed_units = [{allowed_units}]
+restart_cooldown_seconds = 0
+max_restarts_per_hour = 10
+
+[constraints]
+mutate_rate_limit_window_ms = 60000
+mutate_requests_per_peer_per_window = 10
+global_mutate_requests_per_window = 2
+"#
+        )));
+
+        let first = app.handle_request(service_restart_request(units[0], false), current_peer());
+        let second = app.handle_request(
+            service_restart_request_with_id(
+                units[1],
+                false,
+                "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62591",
+            ),
+            peer_with_ids(5555, 6666),
+        );
+        let third = app.handle_request(
+            service_restart_request_with_id(
+                units[2],
+                false,
+                "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62592",
+            ),
+            peer_with_ids(7777, 8888),
+        );
+
+        assert!(matches!(first, Response::Error(_)));
+        assert!(matches!(second, Response::Error(_)));
+        match third {
+            Response::Error(error) => {
+                assert_eq!(error.error.code.to_string(), "rate_limited");
+                assert_eq!(error.error.details.get("request_class"), Some(&json!("mutate")));
+                assert_eq!(error.error.details.get("scope"), Some(&json!("global")));
             }
             Response::Success(success) => panic!("unexpected success response: {:?}", success),
         }
@@ -1284,6 +1662,31 @@ process_limit_max = 10
             pid: unsafe { libc::getpid() as u32 },
             supplementary_gids: Vec::new(),
             unix_user: std::env::var("USER").ok(),
+        }
+    }
+
+    fn peer_with_ids(uid: u32, gid: u32) -> PeerCredentials {
+        PeerCredentials {
+            uid,
+            gid,
+            pid: unsafe { libc::getpid() as u32 },
+            supplementary_gids: Vec::new(),
+            unix_user: std::env::var("USER").ok(),
+        }
+    }
+
+    fn system_status_request(request_id: &str) -> Request {
+        Request {
+            version: 1,
+            request_id: request_id.to_string(),
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Human,
+                id: "test-cli".to_string(),
+            },
+            action: "system.status".to_string(),
+            params: serde_json::from_value(json!({})).expect("params"),
+            dry_run: false,
+            timeout_ms: 3000,
         }
     }
 
