@@ -54,6 +54,8 @@ struct PolicyFile {
     #[serde(default)]
     journal: JournalPolicy,
     #[serde(default)]
+    observability: ObservabilityPolicy,
+    #[serde(default)]
     constraints: ConstraintsPolicy,
 }
 
@@ -102,6 +104,13 @@ struct JournalPolicy {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ObservabilityPolicy {
+    #[serde(default)]
+    hash_requested_by_id: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ConstraintsPolicy {
     security_profile: Option<SecurityProfile>,
     default_timeout_ms: Option<u64>,
@@ -136,6 +145,11 @@ pub struct Constraints {
     pub replay_window_ms: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct ObservabilityConfig {
+    pub hash_requested_by_id: bool,
+}
+
 impl Default for Constraints {
     fn default() -> Self {
         Self {
@@ -166,6 +180,7 @@ pub struct PolicySnapshot {
     restart_cooldown_seconds: u64,
     max_restarts_per_hour: u32,
     constraints: Constraints,
+    observability: ObservabilityConfig,
     clients: Vec<ClientEntry>,
 }
 
@@ -326,6 +341,9 @@ impl PolicyEngine {
                     .unwrap_or(300),
                 max_restarts_per_hour: parsed.service_control.max_restarts_per_hour.unwrap_or(3),
                 constraints,
+                observability: ObservabilityConfig {
+                    hash_requested_by_id: parsed.observability.hash_requested_by_id,
+                },
                 clients,
             },
             cooldowns: Mutex::new(RestartGuardState {
@@ -338,6 +356,10 @@ impl PolicyEngine {
 
     pub fn constraints(&self) -> &Constraints {
         &self.snapshot.constraints
+    }
+
+    pub fn observability(&self) -> &ObservabilityConfig {
+        &self.snapshot.observability
     }
 
     pub fn authorize(

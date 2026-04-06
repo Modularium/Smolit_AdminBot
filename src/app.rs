@@ -312,11 +312,12 @@ impl ReplayEntry {
 impl App {
     pub fn new(policy: PolicyEngine) -> Self {
         let replay_window = Duration::from_millis(policy.constraints().replay_window_ms.max(1));
+        let observability = policy.observability().clone();
         let request_rate_limiter = RequestRateLimiter::from_policy(&policy);
         let mutation_limiter = MutationLimiter::new(policy.constraints().max_parallel_mutations);
         Self {
             policy,
-            audit: AuditLogger::default(),
+            audit: AuditLogger::new(observability),
             request_rate_limiter,
             mutation_limiter,
             replay_protector: ReplayProtector::new(replay_window),
