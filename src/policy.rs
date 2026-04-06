@@ -319,3 +319,134 @@ impl std::fmt::Display for Capability {
         f.write_str(value)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::error::ErrorCode;
+
+    fn write_policy_file(contents: &str) -> PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "adminbot-policy-test-{}-{timestamp}.toml",
+            process::id()
+        ));
+        fs::write(&path, contents).expect("write test policy");
+        path
+    }
+
+    fn remove_policy_file(path: &PathBuf) {
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn loads_v1_policy_snapshot_from_toml() {
+        let path = write_policy_file(
+            r#"
+version = 1
+
+[clients.human_admin]
+unix_user = "dev"
+allowed_capabilities = ["read_basic", "service_read"]
+
+[clients.service_operator]
+unix_group = "root"
+allowed_capabilities = ["service_control"]
+
+[actions]
+allowed = ["system.status", "service.status", "service.restart"]
+denied = ["journal.query"]
+
+[service_control]
+allowed_units = ["sshd.service", "nginx.service"]
+restart_cooldown_seconds = 120
+max_restarts_per_hour = 2
+
+[constraints]
+default_timeout_ms = 5000
+max_timeout_ms = 15000
+journal_limit_max = 50
+process_limit_max = 25
+max_parallel_mutations = 1
+"#,
+        );
+
+        let engine = PolicyEngine::load_from_path(path.clone()).expect("load policy");
+        remove_policy_file(&path);
+
+        assert!(engine.snapshot.actions_allowed.contains("system.status"));
+        assert!(engine.snapshot.actions_denied.contains("journal.query"));
+        assert!(engine
+            .snapshot
+            .service_allowed_units
+            .contains("sshd.service"));
+        assert_eq!(engine.snapshot.restart_cooldown_seconds, 120);
+        assert_eq!(engine.snapshot.max_restarts_per_hour, 2);
+        assert_eq!(engine.snapshot.constraints.default_timeout_ms, 5000);
+        assert_eq!(engine.snapshot.constraints.max_timeout_ms, 15_000);
+        assert_eq!(engine.snapshot.constraints.journal_limit_max, 50);
+        assert_eq!(engine.snapshot.constraints.process_limit_max, 25);
+        assert_eq!(engine.snapshot.constraints.max_parallel_mutations, 1);
+        assert_eq!(engine.snapshot.clients.len(), 2);
+
+        let service_operator = engine
+            .snapshot
+            .clients
+            .iter()
+            .find(|client| client.unix_group.as_deref() == Some("root"))
+            .expect("service_operator client");
+        assert!(service_operator.group_gid.is_some());
+        assert!(service_operator
+            .allowed_capabilities
+            .contains(&Capability::ServiceControl));
+    }
+
+    #[test]
+    fn rejects_policy_versions_other_than_v1() {
+        let path = write_policy_file(
+            r#"
+version = 2
+
+[actions]
+allowed = ["system.status"]
+"#,
+        );
+
+        let error = PolicyEngine::load_from_path(path.clone()).expect_err("unsupported version");
+        remove_policy_file(&path);
+
+        let app_error = error
+            .downcast_ref::<AppError>()
+            .expect("error should be AppError");
+        assert_eq!(app_error.code, ErrorCode::UnsupportedVersion);
+    }
+
+    #[test]
+    fn rejects_unknown_fields_in_policy_file() {
+        let path = write_policy_file(
+            r#"
+version = 1
+unexpected_field = true
+
+[actions]
+allowed = ["system.status"]
+"#,
+        );
+
+        let error = PolicyEngine::load_from_path(path.clone()).expect_err("unknown field");
+        remove_policy_file(&path);
+
+        let message = error.to_string();
+        assert!(message.contains("unknown field"));
+        assert!(message.contains("unexpected_field"));
+    }
+}
