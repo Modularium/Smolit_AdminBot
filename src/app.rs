@@ -26,6 +26,7 @@ impl App {
     }
 
     pub fn handle_request(&self, request: Request, peer: PeerCredentials) -> Response {
+        self.audit.log_received(&request, &peer);
         match self.execute(&request, &peer) {
             Ok(result) => {
                 self.audit.log_success(&request, &peer);
