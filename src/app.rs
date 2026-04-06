@@ -192,6 +192,95 @@ denied = []
         }
     }
 
+    #[test]
+    fn service_status_returns_structured_fields_for_existing_unit() {
+        let app = App::new(policy_for_current_user(
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "__USER__"
+allowed_capabilities = ["service_read"]
+
+[actions]
+allowed = ["service.status"]
+denied = []
+"#,
+        ));
+
+        let request = Request {
+            version: 1,
+            request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62574".to_string(),
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Human,
+                id: "test-cli".to_string(),
+            },
+            action: "service.status".to_string(),
+            params: serde_json::from_value(json!({
+                "unit": existing_service_unit()
+            }))
+            .expect("params"),
+            dry_run: false,
+            timeout_ms: 3000,
+        };
+
+        let response = app.handle_request(request, current_peer());
+        match response {
+            Response::Success(success) => {
+                assert!(success.result["unit"].is_string());
+                assert!(success.result["active_state"].is_string());
+                assert!(success.result["sub_state"].is_string());
+                assert!(success.result["load_state"].is_string());
+                assert!(success.result["unit_file_state"].is_string());
+            }
+            Response::Error(error) => panic!("unexpected error response: {:?}", error),
+        }
+    }
+
+    #[test]
+    fn service_status_rejects_invalid_unit_name() {
+        let app = App::new(policy_for_current_user(
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "__USER__"
+allowed_capabilities = ["service_read"]
+
+[actions]
+allowed = ["service.status"]
+denied = []
+"#,
+        ));
+
+        let request = Request {
+            version: 1,
+            request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62575".to_string(),
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Human,
+                id: "test-cli".to_string(),
+            },
+            action: "service.status".to_string(),
+            params: serde_json::from_value(json!({
+                "unit": "invalid-unit"
+            }))
+            .expect("params"),
+            dry_run: false,
+            timeout_ms: 3000,
+        };
+
+        let response = app.handle_request(request, current_peer());
+        match response {
+            Response::Error(error) => {
+                assert_eq!(
+                    serde_json::to_value(error.error.code).unwrap(),
+                    json!("validation_error")
+                );
+            }
+            Response::Success(success) => panic!("unexpected success response: {:?}", success),
+        }
+    }
+
     fn current_peer() -> PeerCredentials {
         PeerCredentials {
             uid: unsafe { libc::geteuid() },
@@ -219,5 +308,24 @@ denied = []
             .expect("time")
             .as_nanos();
         format!("adminbot-policy-{nanos}.toml")
+    }
+
+    fn existing_service_unit() -> &'static str {
+        const CANDIDATES: [(&str, &str); 3] = [
+            (
+                "systemd-journald.service",
+                "/lib/systemd/system/systemd-journald.service",
+            ),
+            ("dbus.service", "/lib/systemd/system/dbus.service"),
+            ("ssh.service", "/lib/systemd/system/ssh.service"),
+        ];
+
+        for (unit, path) in CANDIDATES {
+            if std::path::Path::new(path).exists() {
+                return unit;
+            }
+        }
+
+        panic!("no suitable local service unit found for test")
     }
 }
