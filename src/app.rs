@@ -48,6 +48,7 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use std::env;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -144,6 +145,49 @@ max_restarts_per_hour = 3
                 );
             }
             Response::Success(success) => panic!("unexpected success response: {:?}", success),
+        }
+    }
+
+    #[test]
+    fn service_restart_not_found_unit_reports_precondition_failed() {
+        let unit = "adminbot-missing-integration.service";
+        let app = App::new(service_restart_policy_for_current_user(unit));
+        let request = service_restart_request(unit, false);
+
+        let response = app.handle_request(request, current_peer());
+        match response {
+            Response::Error(error) => {
+                assert_eq!(
+                    serde_json::to_value(error.error.code).unwrap(),
+                    json!("precondition_failed")
+                );
+                assert_eq!(error.error.details.get("unit"), Some(&json!(unit)));
+            }
+            Response::Success(success) => panic!("unexpected success response: {:?}", success),
+        }
+    }
+
+    #[test]
+    #[ignore = "requires ADMINBOT_TEST_SERVICE_UNIT and a polkit-authorized target setup"]
+    fn service_restart_integration_uses_systemd_dbus_and_polkit() {
+        let unit = integration_test_service_unit();
+        let app = App::new(service_restart_policy_for_current_user(&unit));
+        let request = service_restart_request(&unit, false);
+
+        let response = app.handle_request(request, current_peer());
+        match response {
+            Response::Success(success) => {
+                assert_eq!(success.result["unit"], json!(unit));
+                assert_eq!(success.result["mode"], json!("safe"));
+                assert!(success.result["job_object_path"].as_str().is_some());
+                assert!(success.result["pre_state"]["active_state"].is_string());
+                assert!(success.result["pre_state"]["sub_state"].is_string());
+                assert!(success.result["pre_state"]["load_state"].is_string());
+                assert!(success.result["post_state"]["active_state"].is_string());
+                assert!(success.result["post_state"]["sub_state"].is_string());
+                assert!(success.result["post_state"]["load_state"].is_string());
+            }
+            Response::Error(error) => panic!("unexpected error response: {:?}", error),
         }
     }
 
@@ -779,6 +823,60 @@ process_limit_max = 10
         let engine = PolicyEngine::load_from_path(PathBuf::from(&path)).expect("load policy");
         let _ = fs::remove_file(path);
         engine
+    }
+
+    fn service_restart_policy_for_current_user(unit: &str) -> PolicyEngine {
+        let template = format!(
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "__USER__"
+allowed_capabilities = ["service_control"]
+
+[actions]
+allowed = ["service.restart"]
+denied = []
+
+[service_control]
+allowed_units = ["{unit}"]
+restart_cooldown_seconds = 300
+max_restarts_per_hour = 3
+"#
+        );
+
+        policy_for_current_user(&template)
+    }
+
+    fn service_restart_request(unit: &str, dry_run: bool) -> Request {
+        Request {
+            version: 1,
+            request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62572".to_string(),
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Human,
+                id: "test-cli".to_string(),
+            },
+            action: "service.restart".to_string(),
+            params: serde_json::from_value(json!({
+                "unit": unit,
+                "mode": "safe",
+                "reason": "integration test"
+            }))
+            .expect("params"),
+            dry_run,
+            timeout_ms: 3000,
+        }
+    }
+
+    fn integration_test_service_unit() -> String {
+        let unit = env::var("ADMINBOT_TEST_SERVICE_UNIT").expect(
+            "ADMINBOT_TEST_SERVICE_UNIT must name a safe restartable *.service unit for the integration test",
+        );
+        assert!(
+            unit.ends_with(".service"),
+            "ADMINBOT_TEST_SERVICE_UNIT must end with .service"
+        );
+        unit
     }
 
     fn unique_policy_name() -> String {
