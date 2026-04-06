@@ -862,11 +862,21 @@ fn fetch_service_status(unit: &str) -> AppResult<ServiceStatusView> {
 }
 
 fn poll_post_restart_status(unit: &str, timeout_ms: u64) -> AppResult<ServiceStatusView> {
+    poll_post_restart_status_with_fetcher(timeout_ms, || fetch_service_status(unit))
+}
+
+fn poll_post_restart_status_with_fetcher<F>(
+    timeout_ms: u64,
+    mut fetch_status: F,
+) -> AppResult<ServiceStatusView>
+where
+    F: FnMut() -> AppResult<ServiceStatusView>,
+{
     let poll_deadline =
         std::time::Instant::now() + Duration::from_millis(timeout_ms.min(5_000).max(250));
 
     loop {
-        let status = fetch_service_status(unit)?;
+        let status = fetch_status()?;
         if status.active_state != "activating" {
             return Ok(status);
         }
@@ -1910,6 +1920,24 @@ mod tests {
         assert_eq!(value["unit"], json!("nginx.service"));
         assert_eq!(value["priority"], json!("warning"));
         assert_eq!(value["message"], json!("upstream connection slow"));
+    }
+
+    #[test]
+    fn poll_post_restart_status_returns_timeout_when_service_stays_activating() {
+        let error = poll_post_restart_status_with_fetcher(1, || {
+            Ok(ServiceStatusView {
+                unit: "nginx.service".to_string(),
+                active_state: "activating".to_string(),
+                sub_state: "start".to_string(),
+                load_state: "loaded".to_string(),
+                unit_file_state: "enabled".to_string(),
+            })
+        })
+        .expect_err("activating service should time out");
+
+        assert_eq!(error.code, ErrorCode::Timeout);
+        assert_eq!(error.message, "post-restart status check timed out");
+        assert_eq!(error.retryable, false);
     }
 
     #[test]
