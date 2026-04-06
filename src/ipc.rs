@@ -3,6 +3,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::app::App;
 use crate::error::{AppError, ErrorCode};
@@ -10,6 +11,7 @@ use crate::peer::{get_peer_credentials, set_socket_group};
 use crate::types::{Request, Response};
 
 pub const MAX_IPC_FRAME_SIZE: usize = 64 * 1024;
+pub const IPC_READ_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 enum ReadFrameError {
@@ -69,6 +71,13 @@ impl IpcServer {
     }
 
     fn handle_stream(&self, app: &App, stream: &mut UnixStream) -> Result<Response, AppError> {
+        configure_read_timeout(stream).map_err(|error| {
+            AppError::new(
+                ErrorCode::ExecutionFailed,
+                "failed to configure IPC read timeout",
+            )
+            .with_detail("source", error.to_string())
+        })?;
         let payload = read_frame_checked(stream).map_err(map_read_frame_error)?;
         let peer = get_peer_credentials(stream).map_err(|error| {
             AppError::new(
@@ -172,11 +181,27 @@ fn map_read_frame_error(error: ReadFrameError) -> AppError {
         } => AppError::new(ErrorCode::ValidationError, "IPC frame exceeds maximum size")
             .with_detail("announced_frame_size_bytes", announced_size as u64)
             .with_detail("max_frame_size_bytes", max_size as u64),
+        ReadFrameError::Io(error) if is_timeout_error(&error) => {
+            AppError::new(ErrorCode::Timeout, "IPC read timed out")
+                .with_detail("read_timeout_ms", IPC_READ_TIMEOUT.as_millis() as u64)
+                .retryable(true)
+        }
         ReadFrameError::Io(error) => {
             AppError::new(ErrorCode::ValidationError, "failed to read IPC frame")
                 .with_detail("source", error.to_string())
         }
     }
+}
+
+fn configure_read_timeout(stream: &UnixStream) -> io::Result<()> {
+    stream.set_read_timeout(Some(IPC_READ_TIMEOUT))
+}
+
+fn is_timeout_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+    )
 }
 
 impl ReadFrameError {
@@ -446,6 +471,46 @@ mod tests {
             response["error"]["details"]["max_frame_size_bytes"],
             serde_json::json!(MAX_IPC_FRAME_SIZE as u64)
         );
+
+        handle.join().expect("join").expect("server run_once");
+        let _ = fs::remove_file(policy_path);
+    }
+
+    #[test]
+    fn run_once_times_out_slow_client_reads() {
+        let socket_path = temp_socket_path("slow-read");
+        let policy_path = temp_policy_path();
+        let policy = PolicyEngine::load_from_path(policy_path.clone()).expect("policy");
+        let app = App::new(policy);
+        let server = IpcServer::bind_for_test(socket_path.clone()).expect("bind");
+
+        let handle = thread::spawn(move || server.run_once(&app));
+
+        let mut client = connect_with_retry(&socket_path);
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("client read timeout");
+
+        let started = std::time::Instant::now();
+        let response_payload = read_frame(&mut client).expect("read timeout response");
+        let elapsed = started.elapsed();
+        let response: serde_json::Value =
+            serde_json::from_slice(&response_payload).expect("decode response");
+
+        assert!(elapsed >= IPC_READ_TIMEOUT);
+        assert!(elapsed < Duration::from_secs(3));
+        assert_eq!(
+            response["request_id"],
+            "00000000-0000-0000-0000-000000000000"
+        );
+        assert_eq!(response["status"], "error");
+        assert_eq!(response["error"]["code"], "timeout");
+        assert_eq!(response["error"]["message"], "IPC read timed out");
+        assert_eq!(
+            response["error"]["details"]["read_timeout_ms"],
+            serde_json::json!(IPC_READ_TIMEOUT.as_millis() as u64)
+        );
+        assert_eq!(response["error"]["retryable"], true);
 
         handle.join().expect("join").expect("server run_once");
         let _ = fs::remove_file(policy_path);
