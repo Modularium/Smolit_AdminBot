@@ -34,7 +34,7 @@
 [x] `request_id` muss UUID sein
 [x] maximale IPC-Frame-Groesse auf `64 KiB` definieren und technisch erzwingen
 [x] Socket-Read-Timeouts mit konservativem Default von `1000 ms` definieren
-[ ] Socket-Write-Timeouts definieren
+[x] Socket-Write-Timeouts mit konservativem Default von `1000 ms` definieren
 [ ] Schutz gegen Slow-Client-Blockade definieren
 [ ] Request-Flooding und lokale Admission-Control bewerten
 [ ] Replay-Schutz fuer mutierende Requests explizit bewerten

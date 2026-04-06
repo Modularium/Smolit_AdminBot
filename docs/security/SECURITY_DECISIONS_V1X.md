@@ -24,7 +24,7 @@ Dieses Dokument haelt die sicherheitsrelevanten Entscheidungen fuer die Nachhaer
 
 - Prioritaet: `P0`
 - GitHub-Issue: `#73`
-- Entscheidung: Antwortpfade duerfen nicht unbegrenzt auf blockierende Clients warten.
+- Entscheidung: Antwortpfade duerfen nicht unbegrenzt auf blockierende Clients warten und setzen einen konservativen IPC-Write-Timeout von `1000 ms`.
 - Begruendung: Verfuegbarkeits- und Rueckstau-Risiko am IPC-Ausgangspfad.
 - Nicht Ziel: neuer Transport oder asynchrones Komplettmodell.
 

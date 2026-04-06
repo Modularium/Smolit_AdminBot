@@ -12,6 +12,7 @@ use crate::types::{Request, Response};
 
 pub const MAX_IPC_FRAME_SIZE: usize = 64 * 1024;
 pub const IPC_READ_TIMEOUT: Duration = Duration::from_secs(1);
+pub const IPC_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 enum ReadFrameError {
@@ -108,6 +109,7 @@ impl IpcServer {
             }
         };
 
+        configure_write_timeout(stream)?;
         write_frame(stream, &response).map_err(|error| {
             eprintln!("adminbotd socket write failed: {error}");
             error
@@ -197,6 +199,10 @@ fn configure_read_timeout(stream: &UnixStream) -> io::Result<()> {
     stream.set_read_timeout(Some(IPC_READ_TIMEOUT))
 }
 
+fn configure_write_timeout(stream: &UnixStream) -> io::Result<()> {
+    stream.set_write_timeout(Some(IPC_WRITE_TIMEOUT))
+}
+
 fn is_timeout_error(error: &io::Error) -> bool {
     matches!(
         error.kind(),
@@ -238,6 +244,7 @@ mod tests {
     use crate::policy::PolicyEngine;
     use std::io::Cursor;
     use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::io::AsRawFd;
     use std::os::unix::net::UnixStream;
     use std::time::{SystemTime, UNIX_EPOCH};
     use std::{env, fs, io::Write, path::PathBuf, thread};
@@ -516,6 +523,28 @@ mod tests {
         let _ = fs::remove_file(policy_path);
     }
 
+    #[test]
+    fn write_frame_times_out_for_non_reading_peer() {
+        let (mut server_stream, _client_stream) = UnixStream::pair().expect("pair");
+        configure_write_timeout(&server_stream).expect("configure write timeout");
+        set_socket_send_buffer(&server_stream, 4096).expect("set send buffer");
+
+        let response = Response::success(
+            "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62581",
+            serde_json::json!({
+                "payload": "x".repeat(MAX_IPC_FRAME_SIZE * 32)
+            }),
+        );
+
+        let started = std::time::Instant::now();
+        let error = write_frame(&mut server_stream, &response).expect_err("write must time out");
+        let elapsed = started.elapsed();
+
+        assert!(is_timeout_error(&error));
+        assert!(elapsed >= IPC_WRITE_TIMEOUT);
+        assert!(elapsed < Duration::from_secs(3));
+    }
+
     fn temp_socket_path(name: &str) -> PathBuf {
         let mut path = env::temp_dir();
         let nanos = SystemTime::now()
@@ -564,5 +593,24 @@ mod tests {
             .expect("write length");
         stream.write_all(payload).expect("write payload");
         stream.flush().expect("flush");
+    }
+
+    fn set_socket_send_buffer(stream: &UnixStream, size: usize) -> io::Result<()> {
+        let size = size as libc::c_int;
+        let result = unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &size as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&size) as libc::socklen_t,
+            )
+        };
+
+        if result == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        }
     }
 }
