@@ -17,9 +17,12 @@ denied = []
 
 # Opt-in only after explicit local security review:
 # - add "read_sensitive" only for trusted incident operators
+# - prefer "journal_read" over "read_sensitive" when only journald access is needed
+# - prefer "process_read" over "read_sensitive" when only process diagnostics are needed
 # - add "journal.query" only when journald exposure is really needed
 # - add "process.snapshot" only when process-level diagnostics are required
-# - add "service.restart" only together with "service_control"
+# - prefer "service_restart" over "service_control" when only restart is intended
+# - add "service.restart" only together with "service_control" or "service_restart"
 
 [service_control]
 allowed_units = ["nginx.service"]
