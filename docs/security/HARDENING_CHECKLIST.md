@@ -92,5 +92,5 @@
 
 [x] lokaler Testbestand fuer Validierung und Policy ist vorhanden
 [x] Integrationstest fuer echten Restart-Pfad existiert als opt-in ignored test
-[ ] Security-Regression-Checkliste in Release-Prozess aufnehmen
+[x] Security-Release-Gate-Script fuer Repo-Artefakte und Live-Deployment ist vorhanden
 [ ] manuelle Zielsystem-Pruefung fuer Hardening regelmaessig wiederholen
