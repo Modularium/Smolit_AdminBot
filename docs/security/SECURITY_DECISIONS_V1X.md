@@ -1,0 +1,156 @@
+# AdminBot Security Decisions v1.0.x
+
+## Zweck
+
+Dieses Dokument haelt die sicherheitsrelevanten Entscheidungen fuer die Nachhaertung von AdminBot v1.0.x fest. Es beschreibt keine Implementierung im Detail, sondern verbindliche Leitplanken fuer die naechsten Sicherheitsphasen.
+
+## Entscheidung 1: Maximale IPC-Frame-Groesse wird verpflichtend
+
+- Prioritaet: `P0`
+- GitHub-Issue: `#71`
+- Entscheidung: eingehende IPC-Frames erhalten eine harte technische Obergrenze von `64 KiB`.
+- Begruendung: ohne Obergrenze bleibt die lokale IPC-Grenze fuer Speicher- und DoS-Angriffe zu offen.
+- Nicht Ziel: generische Streaming-API oder Protokollumbau.
+
+## Entscheidung 2: Socket-Read-Timeouts werden verpflichtend
+
+- Prioritaet: `P0`
+- GitHub-Issue: `#72`
+- Entscheidung: der Daemon darf langsame Clients nicht unbegrenzt bedienen.
+- Begruendung: Slow-Client-DoS ist bei sequentieller Verarbeitung ein realistisches lokales Risiko.
+- Nicht Ziel: parallele Komplettarchitektur in diesem Schritt.
+
+## Entscheidung 3: Socket-Write-Timeouts werden verpflichtend
+
+- Prioritaet: `P0`
+- GitHub-Issue: `#73`
+- Entscheidung: Antwortpfade duerfen nicht unbegrenzt auf blockierende Clients warten.
+- Begruendung: Verfuegbarkeits- und Rueckstau-Risiko am IPC-Ausgangspfad.
+- Nicht Ziel: neuer Transport oder asynchrones Komplettmodell.
+
+## Entscheidung 4: Lokale Admission-Control wird eingefuehrt
+
+- Prioritaet: `P0`
+- GitHub-Issue: `#74`
+- Entscheidung: AdminBot fuehrt lokale Missbrauchsgrenzen fuer Verbindungen oder Request-Raten ein.
+- Begruendung: reine Eingabevalidierung reicht gegen Flooding nicht aus.
+- Nicht Ziel: globales verteiltes Rate-Limiting.
+
+## Entscheidung 5: `requested_by` ist ohne Peer-Bindung nicht sicherheitsrelevant
+
+- Prioritaet: `P0`
+- GitHub-Issue: `#75`
+- Entscheidung: selbstdeklarierte Request-Metadaten duerfen keine eigenstaendige Security-Semantik tragen, wenn sie nicht an echte Peer-Credentials gebunden sind.
+- Begruendung: Identitaets- und Capability-Entscheidungen muessen auf belastbaren lokalen Identitaetsdaten beruhen.
+- Nicht Ziel: externe Authentifizierungsinfrastruktur oder Netzwerk-Identity-Layer.
+
+## Entscheidung 6: Policy-Dateirechte werden beim Start validiert
+
+- Prioritaet: `P0`
+- GitHub-Issue: `#76`
+- Entscheidung: `/etc/adminbot/policy.toml` wird als sicherheitskritisches Artefakt behandelt und bei ungueltigem Owner oder Modus abgelehnt.
+- Begruendung: Policy-Manipulation unterlaeuft die zentrale Sicherheitsgrenze von AdminBot.
+- Nicht Ziel: komplexes Secret-Management-System.
+
+## Entscheidung 7: polkit-Regeln sind versionierte Security-Artefakte
+
+- Prioritaet: `P0`
+- GitHub-Issue: `#77`
+- Entscheidung: polkit-Regeln werden versioniert, dokumentiert und als Teil des Security-Reviews behandelt.
+- Begruendung: die D-Bus/polkit-Bruecke ist die reale Privileggrenze fuer mutierende Service-Aktionen.
+- Nicht Ziel: Ersatz von polkit durch eigene Privilegmechanismen.
+
+## Entscheidung 8: `max_parallel_mutations` wird technisch erzwungen
+
+- Prioritaet: `P1`
+- GitHub-Issue: `#78`
+- Entscheidung: modellierte Mutationsgrenzen muessen in der Laufzeit Wirkung entfalten.
+- Begruendung: Sicherheitsmodelle ohne technische Erzwingung sind fuer Missbrauchskontrolle zu schwach.
+- Nicht Ziel: aggressive Parallelisierung der gesamten Architektur.
+
+## Entscheidung 9: Audit-Flood-Schutz wird ausgebaut
+
+- Prioritaet: `P1`
+- GitHub-Issue: `#79`
+- Entscheidung: wiederholte invalide oder missbrauchsartige Requests duerfen den Audit-Kanal nicht dominieren.
+- Begruendung: Sichtbarkeit fuer echte Vorfaelle darf nicht durch triviales Flooding verloren gehen.
+- Nicht Ziel: Entfernung sicherheitsrelevanter Audit-Daten.
+
+## Entscheidung 10: Journald-Ausgabegroessen erhalten Guardrails
+
+- Prioritaet: `P1`
+- GitHub-Issue: `#80`
+- Entscheidung: Read-only Datenpfade muessen auch globale Groessen- und Exfiltrationsgrenzen beachten.
+- Begruendung: Count- und Zeitfenstergrenzen allein reduzieren Informationsabfluss nicht ausreichend.
+- Nicht Ziel: generische Inhaltsklassifikation fuer alle Logs in derselben Phase.
+
+## Entscheidung 11: Runtime- und Socket-Invarianten werden beim Start validiert
+
+- Prioritaet: `P1`
+- GitHub-Issue: `#81`
+- Entscheidung: `/run/adminbot`, Socket-Datei und zugehoerige Besitz-/Modusannahmen werden beim Start oder frueh in der Laufzeit geprueft.
+- Begruendung: lokale IPC-Sicherheit ist stark vom korrekten Deployment der Laufzeitartefakte abhaengig.
+- Nicht Ziel: Ersatz von systemd fuer Socket-Management.
+
+## Entscheidung 12: Release-Freigaben enthalten ein Security-Gate
+
+- Prioritaet: `P1`
+- GitHub-Issue: `#82`
+- Entscheidung: Release und produktives Deployment gelten erst nach expliziter Pruefung von Policy, polkit, Hardening und Zielsystem-Nachweisen als freigabefaehig.
+- Begruendung: ein sicherer Codepfad ist wertlos, wenn die Betriebsartefakte driften oder unreviewt ausgerollt werden.
+- Nicht Ziel: vollautomatisierte Compliance-Plattform.
+
+## Entscheidung 13: Replay-Schutz fuer mutierende Requests wird definiert
+
+- Prioritaet: `P2`
+- GitHub-Issue: `#83`
+- Entscheidung: mutierende Requests erhalten eine dokumentierte Strategie fuer Wiederholung, Duplikaterkennung oder Idempotenz.
+- Begruendung: wiederholte lokale Requests koennen trotz Policy und Cooldown operative Nebenwirkungen erzeugen.
+- Nicht Ziel: verteilter Exactly-Once-Mechanismus.
+
+## Entscheidung 14: Abuse-Counter duerfen nicht an Daemon-Neustarts scheitern
+
+- Prioritaet: `P2`
+- GitHub-Issue: `#84`
+- Entscheidung: Restart-Abuse-Schutz wird ueber Neustarts hinweg robuster gemacht oder betrieblich gleichwertig abgesichert.
+- Begruendung: volatile Schutzzaehler sind fuer laenger laufende Systeme schwach.
+- Nicht Ziel: komplexe persistente Telemetrieplattform.
+
+## Entscheidung 15: systemd-Haertung wird ueber die Baseline hinaus erweitert
+
+- Prioritaet: `P2`
+- GitHub-Issue: `#85`
+- Entscheidung: weitere systemd-Hardening-Optionen werden gezielt gegen reale Funktionsanforderungen geprueft.
+- Begruendung: die aktuelle Baseline ist gut, aber noch nicht maximal reduziert.
+- Nicht Ziel: blinde Aktivierung aller systemd-Optionen ohne Funktionspruefung.
+
+## Entscheidung 16: Audit-Retention und Journald-Exposure werden betrieblich definiert
+
+- Prioritaet: `P2`
+- GitHub-Issue: `#86`
+- Entscheidung: Audit-Sichtbarkeit, Aufbewahrung und Expositionsgrenzen werden als Betriebsprozess dokumentiert.
+- Begruendung: Incident Response braucht reproduzierbare und sichere Audit-Betriebsregeln.
+- Nicht Ziel: Aufbau eines separaten SIEM-Produkts im selben Schritt.
+
+## Entscheidung 17: Read-only Actions erhalten Security-Klassifikation
+
+- Prioritaet: `P3`
+- GitHub-Issue: `#87`
+- Entscheidung: Read-only Actions werden nicht pauschal als harmlos betrachtet, sondern nach Sensitivitaet klassifiziert.
+- Begruendung: Informationen ueber Journald, Services, Dateisystem und Systemzustand koennen fuer Spaehung oder Planung missbraucht werden.
+- Nicht Ziel: sofortige funktionale Beschneidung aller Read-only Actions.
+
+## Produktionsfreigabe-Leitlinie
+
+AdminBot gilt erst dann als "hoch sicher fuer produktiven Einsatz", wenn mindestens folgende Entscheidungen umgesetzt und betrieblich verifiziert sind:
+
+- Entscheidung 1 bis 7
+- gehärtete `adminbotd.service` auf dem Zielsystem aktiv
+- versionierte und gepruefte polkit-Regeln
+- root-kontrollierte und validierte Policy-Datei
+- validierte Runtime- und Socket-Rechte
+
+## Annahmen
+
+- Das Grunddesign mit non-root Daemon, Unix Socket, statischer Registry und D-Bus/polkit bleibt bestehen.
+- Die Nachhaertung erfolgt ohne Shell-Exec, ohne Plugin-System und ohne neue generische Privilegpfade.
