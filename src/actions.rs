@@ -29,6 +29,19 @@ pub enum PrivilegeRequirement {
     PrivilegedBackend,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionHandler {
+    SystemStatus,
+    SystemHealth,
+    ResourceSnapshot,
+    DiskUsage,
+    NetworkInterfaceStatus,
+    ServiceStatus,
+    JournalQuery,
+    ProcessSnapshot,
+    ServiceRestart,
+}
+
 #[derive(Debug, Clone, Copy)]
 #[allow(dead_code)]
 pub struct ActionMetadata {
@@ -36,6 +49,7 @@ pub struct ActionMetadata {
     pub required_capability: Capability,
     pub risk: RiskLevel,
     pub privilege_requirement: PrivilegeRequirement,
+    pub handler: ActionHandler,
 }
 
 const ACTIONS: &[ActionMetadata] = &[
@@ -44,54 +58,63 @@ const ACTIONS: &[ActionMetadata] = &[
         required_capability: Capability::ReadBasic,
         risk: RiskLevel::R0,
         privilege_requirement: PrivilegeRequirement::None,
+        handler: ActionHandler::SystemStatus,
     },
     ActionMetadata {
         name: "system.health",
         required_capability: Capability::ReadBasic,
         risk: RiskLevel::R0,
         privilege_requirement: PrivilegeRequirement::None,
+        handler: ActionHandler::SystemHealth,
     },
     ActionMetadata {
         name: "resource.snapshot",
         required_capability: Capability::ReadBasic,
         risk: RiskLevel::R0,
         privilege_requirement: PrivilegeRequirement::None,
+        handler: ActionHandler::ResourceSnapshot,
     },
     ActionMetadata {
         name: "disk.usage",
         required_capability: Capability::ReadBasic,
         risk: RiskLevel::R0,
         privilege_requirement: PrivilegeRequirement::None,
+        handler: ActionHandler::DiskUsage,
     },
     ActionMetadata {
         name: "network.interface_status",
         required_capability: Capability::ReadBasic,
         risk: RiskLevel::R0,
         privilege_requirement: PrivilegeRequirement::None,
+        handler: ActionHandler::NetworkInterfaceStatus,
     },
     ActionMetadata {
         name: "service.status",
         required_capability: Capability::ServiceRead,
         risk: RiskLevel::R1,
         privilege_requirement: PrivilegeRequirement::Elevated,
+        handler: ActionHandler::ServiceStatus,
     },
     ActionMetadata {
         name: "journal.query",
         required_capability: Capability::ReadSensitive,
         risk: RiskLevel::R1,
         privilege_requirement: PrivilegeRequirement::Elevated,
+        handler: ActionHandler::JournalQuery,
     },
     ActionMetadata {
         name: "process.snapshot",
         required_capability: Capability::ReadSensitive,
         risk: RiskLevel::R1,
         privilege_requirement: PrivilegeRequirement::Elevated,
+        handler: ActionHandler::ProcessSnapshot,
     },
     ActionMetadata {
         name: "service.restart",
         required_capability: Capability::ServiceControl,
         risk: RiskLevel::R2,
         privilege_requirement: PrivilegeRequirement::PrivilegedBackend,
+        handler: ActionHandler::ServiceRestart,
     },
 ];
 
@@ -243,18 +266,25 @@ pub fn validate_request_shape(request: &Request, app: &App) -> AppResult<ActionM
 }
 
 pub fn execute(app: &App, request: &Request) -> AppResult<Value> {
-    match request.action.as_str() {
-        "system.status" => system_status(request),
-        "system.health" => system_health(),
-        "resource.snapshot" => resource_snapshot(),
-        "disk.usage" => disk_usage(request),
-        "service.status" => service_status(request),
-        "service.restart" => service_restart(app, request),
-        "network.interface_status" | "journal.query" | "process.snapshot" => Err(AppError::new(
+    let metadata = metadata(&request.action)
+        .ok_or_else(|| AppError::new(ErrorCode::ValidationError, "unknown action"))?;
+    execute_handler(app, request, metadata.handler)
+}
+
+fn execute_handler(app: &App, request: &Request, handler: ActionHandler) -> AppResult<Value> {
+    match handler {
+        ActionHandler::SystemStatus => system_status(request),
+        ActionHandler::SystemHealth => system_health(),
+        ActionHandler::ResourceSnapshot => resource_snapshot(),
+        ActionHandler::DiskUsage => disk_usage(request),
+        ActionHandler::ServiceStatus => service_status(request),
+        ActionHandler::ServiceRestart => service_restart(app, request),
+        ActionHandler::NetworkInterfaceStatus
+        | ActionHandler::JournalQuery
+        | ActionHandler::ProcessSnapshot => Err(AppError::new(
             ErrorCode::BackendUnavailable,
             "action is registered but not implemented in this minimal build",
         )),
-        _ => Err(AppError::new(ErrorCode::ValidationError, "unknown action")),
     }
 }
 
@@ -913,5 +943,140 @@ fn ratio(used: u64, total: u64) -> f64 {
 fn restart_mode_name(mode: &ServiceRestartMode) -> &'static str {
     match mode {
         ServiceRestartMode::Safe => "safe",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::PolicyEngine;
+    use crate::types::{Request, RequestOriginType, RequestedBy};
+    use serde_json::json;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn metadata_covers_all_v1_actions_with_handler_mapping() {
+        let expected = [
+            (
+                "system.status",
+                Capability::ReadBasic,
+                ActionHandler::SystemStatus,
+            ),
+            (
+                "system.health",
+                Capability::ReadBasic,
+                ActionHandler::SystemHealth,
+            ),
+            (
+                "resource.snapshot",
+                Capability::ReadBasic,
+                ActionHandler::ResourceSnapshot,
+            ),
+            (
+                "disk.usage",
+                Capability::ReadBasic,
+                ActionHandler::DiskUsage,
+            ),
+            (
+                "network.interface_status",
+                Capability::ReadBasic,
+                ActionHandler::NetworkInterfaceStatus,
+            ),
+            (
+                "service.status",
+                Capability::ServiceRead,
+                ActionHandler::ServiceStatus,
+            ),
+            (
+                "journal.query",
+                Capability::ReadSensitive,
+                ActionHandler::JournalQuery,
+            ),
+            (
+                "process.snapshot",
+                Capability::ReadSensitive,
+                ActionHandler::ProcessSnapshot,
+            ),
+            (
+                "service.restart",
+                Capability::ServiceControl,
+                ActionHandler::ServiceRestart,
+            ),
+        ];
+
+        assert_eq!(ACTIONS.len(), expected.len());
+
+        for (name, capability, handler) in expected {
+            let metadata = metadata(name).expect("action must be registered");
+            assert_eq!(metadata.name, name);
+            assert_eq!(metadata.required_capability, capability);
+            assert_eq!(metadata.handler, handler);
+        }
+    }
+
+    #[test]
+    fn metadata_returns_none_for_unknown_action() {
+        assert!(metadata("unknown.action").is_none());
+    }
+
+    #[test]
+    fn validate_request_shape_rejects_unknown_action() {
+        let app = App::new(policy_for_current_user());
+        let request = Request {
+            version: 1,
+            request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62571".to_string(),
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Human,
+                id: "registry-test".to_string(),
+            },
+            action: "unknown.action".to_string(),
+            params: serde_json::from_value(json!({})).expect("params"),
+            dry_run: false,
+            timeout_ms: 3000,
+        };
+
+        let error = validate_request_shape(&request, &app).expect_err("unknown action");
+        assert_eq!(error.code, ErrorCode::ValidationError);
+        assert_eq!(error.message, "unknown action");
+        assert_eq!(error.details.get("action"), Some(&json!("unknown.action")));
+    }
+
+    fn policy_for_current_user() -> PolicyEngine {
+        let user = std::env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+        let content = format!(
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "{user}"
+allowed_capabilities = ["read_basic", "read_sensitive", "service_read", "service_control"]
+
+[actions]
+allowed = ["system.status", "system.health", "resource.snapshot", "disk.usage", "network.interface_status", "service.status", "journal.query", "process.snapshot", "service.restart"]
+denied = []
+
+[service_control]
+allowed_units = ["nginx.service"]
+restart_cooldown_seconds = 300
+max_restarts_per_hour = 3
+"#
+        );
+
+        let mut path = std::env::temp_dir();
+        path.push(unique_policy_name());
+        fs::write(&path, content).expect("write policy");
+        let engine = PolicyEngine::load_from_path(PathBuf::from(&path)).expect("load policy");
+        let _ = fs::remove_file(path);
+        engine
+    }
+
+    fn unique_policy_name() -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        format!("adminbot-actions-policy-{nanos}.toml")
     }
 }
