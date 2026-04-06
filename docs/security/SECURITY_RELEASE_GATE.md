@@ -9,6 +9,7 @@ Der verbindliche Gate-Check liegt unter:
 - `scripts/verify_security_release_gate.sh`
 
 Das Script liefert ausschliesslich klare `PASS`- und `FAIL`-Meldungen und beendet sich bei Findings mit Exit-Code `1`.
+Es delegiert bewusst an `adminbotctl gate run`, damit die Gate-Logik nur an einer Stelle gepflegt wird.
 
 ## Modi
 
@@ -26,6 +27,7 @@ Aufruf:
 
 ```bash
 bash scripts/verify_security_release_gate.sh --mode artifact
+adminbotctl gate run --mode artifact
 ```
 
 CI-Erzwingung:
@@ -54,6 +56,7 @@ Aufruf:
 
 ```bash
 bash scripts/verify_security_release_gate.sh --mode live
+adminbotctl gate run --mode live
 ```
 
 ## Gepruefte Invarianten
@@ -140,6 +143,7 @@ Der Repository-Check ist nicht nur lokal verfuegbar, sondern wird zentral ueber 
 
 - Pflicht-Job: `security-gate`
 - Script: `bash scripts/verify_security_release_gate.sh --mode artifact`
+- CLI: `adminbotctl gate run --mode artifact`
 - Wirkung:
   - Pull Requests muessen das Gate bestehen, bevor sie als sicher reviewbar gelten
   - Pushes auf `dev` und `main` schlagen sichtbar fehl, wenn Policy-, polkit- oder Hardening-Artefakte driften

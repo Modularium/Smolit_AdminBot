@@ -36,21 +36,21 @@ impl Request {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SuccessResponse {
     pub request_id: String,
-    pub status: &'static str,
+    pub status: String,
     pub result: Value,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ErrorResponse {
     pub request_id: String,
-    pub status: &'static str,
+    pub status: String,
     pub error: ErrorBody,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum Response {
     Success(SuccessResponse),
@@ -61,7 +61,7 @@ impl Response {
     pub fn success(request_id: impl Into<String>, result: Value) -> Self {
         Self::Success(SuccessResponse {
             request_id: request_id.into(),
-            status: "ok",
+            status: "ok".to_string(),
             result,
         })
     }
@@ -69,7 +69,7 @@ impl Response {
     pub fn error(request_id: impl Into<String>, error: ErrorBody) -> Self {
         Self::Error(ErrorResponse {
             request_id: request_id.into(),
-            status: "error",
+            status: "error".to_string(),
             error,
         })
     }
