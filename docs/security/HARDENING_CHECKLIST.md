@@ -28,6 +28,8 @@
 [x] Socket ist lokal und Unix Domain Socket
 [x] Socket-Modus ist `0660`
 [x] Socket-Gruppenzuordnung auf `adminbotctl` ist vorgesehen
+[x] Runtime-Verzeichnis `/run/adminbot` wird mit erwarteten Invarianten geprueft: real directory, Owner `adminbot`, Gruppe `adminbot`, Modus `0750`
+[x] unsichere Alt-Artefakte am Socket-Pfad blockieren den Start fail closed
 [x] Peer-Credentials werden ueber `SO_PEERCRED` gelesen
 [x] Requests sind versioniert
 [x] unbekannte Felder werden in Kernstrukturen abgewiesen

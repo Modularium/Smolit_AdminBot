@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use crate::app::App;
 use crate::error::{AppError, ErrorCode};
-use crate::peer::{get_peer_credentials, set_socket_group};
+use crate::peer::{get_peer_credentials, gid_from_group_name, set_socket_group};
 use crate::types::{Request, Response};
 
 pub const MAX_IPC_FRAME_SIZE: usize = 64 * 1024;
@@ -17,6 +17,8 @@ pub const IPC_READ_TIMEOUT: Duration = Duration::from_secs(1);
 pub const IPC_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
 pub const IPC_ADMISSION_WINDOW: Duration = Duration::from_secs(1);
 pub const IPC_MAX_CONNECTIONS_PER_WINDOW: usize = 8;
+pub const RUNTIME_DIRECTORY_MODE: u32 = 0o750;
+pub const SOCKET_FILE_MODE: u32 = 0o660;
 
 #[derive(Debug)]
 enum ReadFrameError {
@@ -36,17 +38,19 @@ pub struct IpcServer {
 
 impl IpcServer {
     pub fn bind(socket_path: PathBuf, socket_group: &str) -> io::Result<Self> {
-        if let Some(parent) = socket_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        if socket_path.exists() {
-            fs::remove_file(&socket_path)?;
-        }
+        let expected_uid = current_effective_uid();
+        let expected_runtime_gid = current_effective_gid();
+        let expected_socket_gid = prepare_socket_path(
+            &socket_path,
+            socket_group,
+            expected_uid,
+            expected_runtime_gid,
+        )?;
 
         let listener = UnixListener::bind(&socket_path)?;
-        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o660))?;
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(SOCKET_FILE_MODE))?;
         set_socket_group(&socket_path, socket_group)?;
+        validate_socket_file_for_ids(&socket_path, expected_uid, expected_socket_gid)?;
 
         Ok(Self {
             listener,
@@ -171,14 +175,16 @@ impl IpcServer {
     fn bind_for_test(socket_path: PathBuf) -> io::Result<Self> {
         if let Some(parent) = socket_path.parent() {
             fs::create_dir_all(parent)?;
+            fs::set_permissions(parent, fs::Permissions::from_mode(RUNTIME_DIRECTORY_MODE))?;
         }
 
-        if socket_path.exists() {
-            fs::remove_file(&socket_path)?;
-        }
+        let expected_uid = current_effective_uid();
+        let expected_gid = current_effective_gid();
+        prepare_test_socket_path(&socket_path, expected_uid, expected_gid)?;
 
         let listener = UnixListener::bind(&socket_path)?;
-        fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o660))?;
+        fs::set_permissions(&socket_path, fs::Permissions::from_mode(SOCKET_FILE_MODE))?;
+        validate_socket_file_for_ids(&socket_path, expected_uid, expected_gid)?;
 
         Ok(Self {
             listener,
@@ -298,6 +304,182 @@ struct AdmissionControl {
     accepted_at: VecDeque<Instant>,
 }
 
+fn prepare_socket_path(
+    socket_path: &Path,
+    socket_group: &str,
+    expected_uid: u32,
+    expected_runtime_gid: u32,
+) -> io::Result<u32> {
+    let runtime_dir = socket_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket path must include a runtime directory",
+        )
+    })?;
+    validate_runtime_directory_for_ids(runtime_dir, expected_uid, expected_runtime_gid)?;
+
+    let expected_socket_gid = gid_from_group_name(socket_group)?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("group {socket_group} not found"),
+        )
+    })?;
+
+    prepare_existing_socket_artifact(socket_path, expected_uid, expected_socket_gid)?;
+    Ok(expected_socket_gid)
+}
+
+#[cfg(test)]
+fn prepare_test_socket_path(
+    socket_path: &Path,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> io::Result<()> {
+    let runtime_dir = socket_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket path must include a runtime directory",
+        )
+    })?;
+    validate_runtime_directory_for_ids(runtime_dir, expected_uid, expected_gid)?;
+    prepare_existing_socket_artifact(socket_path, expected_uid, expected_gid)
+}
+
+fn prepare_existing_socket_artifact(
+    socket_path: &Path,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> io::Result<()> {
+    if !socket_path.exists() {
+        return Ok(());
+    }
+
+    validate_socket_file_for_ids(socket_path, expected_uid, expected_gid)?;
+    fs::remove_file(socket_path)
+}
+
+fn validate_runtime_directory_for_ids(
+    path: &Path,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("runtime directory is missing or unreadable: {error}"),
+        )
+    })?;
+
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("runtime path {} must be a real directory", path.display()),
+        ));
+    }
+
+    if metadata.uid() != expected_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "runtime directory owner mismatch for {}: expected uid {expected_uid}, got {}",
+                path.display(),
+                metadata.uid()
+            ),
+        ));
+    }
+
+    if metadata.gid() != expected_gid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "runtime directory group mismatch for {}: expected gid {expected_gid}, got {}",
+                path.display(),
+                metadata.gid()
+            ),
+        ));
+    }
+
+    let mode = metadata.mode() & 0o777;
+    if mode != RUNTIME_DIRECTORY_MODE {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "runtime directory mode mismatch for {}: expected {:o}, got {:o}",
+                path.display(),
+                RUNTIME_DIRECTORY_MODE,
+                mode
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_socket_file_for_ids(
+    path: &Path,
+    expected_uid: u32,
+    expected_gid: u32,
+) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!("socket path is missing or unreadable: {error}"),
+        )
+    })?;
+
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("socket path {} must be a unix socket", path.display()),
+        ));
+    }
+
+    if metadata.uid() != expected_uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "socket owner mismatch for {}: expected uid {expected_uid}, got {}",
+                path.display(),
+                metadata.uid()
+            ),
+        ));
+    }
+
+    if metadata.gid() != expected_gid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "socket group mismatch for {}: expected gid {expected_gid}, got {}",
+                path.display(),
+                metadata.gid()
+            ),
+        ));
+    }
+
+    let mode = metadata.mode() & 0o777;
+    if mode != SOCKET_FILE_MODE {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "socket mode mismatch for {}: expected {:o}, got {:o}",
+                path.display(),
+                SOCKET_FILE_MODE,
+                mode
+            ),
+        ));
+    }
+
+    Ok(())
+}
+
+fn current_effective_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+fn current_effective_gid() -> u32 {
+    unsafe { libc::getegid() }
+}
+
 impl AdmissionControl {
     fn new(max_connections: usize, window: Duration) -> Self {
         Self {
@@ -399,7 +581,90 @@ mod tests {
         let server = IpcServer::bind_for_test(path.clone()).expect("bind");
         let metadata = fs::metadata(server.socket_path()).expect("metadata");
         assert!(metadata.file_type().is_socket());
-        assert_eq!(metadata.permissions().mode() & 0o777, 0o660);
+        assert_eq!(metadata.permissions().mode() & 0o777, SOCKET_FILE_MODE);
+        drop(server);
+    }
+
+    #[test]
+    fn runtime_directory_validation_rejects_world_writable_directory() {
+        let runtime_dir = temp_runtime_dir("runtime-world-writable");
+        fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o777)).expect("chmod");
+
+        let error = validate_runtime_directory_for_ids(
+            &runtime_dir,
+            current_effective_uid(),
+            current_effective_gid(),
+        )
+        .expect_err("world-writable runtime dir must fail");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("mode mismatch"));
+
+        let _ = fs::remove_dir(&runtime_dir);
+    }
+
+    #[test]
+    fn runtime_directory_validation_rejects_unexpected_owner() {
+        let runtime_dir = temp_runtime_dir("runtime-owner");
+        let error = validate_runtime_directory_for_ids(
+            &runtime_dir,
+            current_effective_uid().saturating_add(1),
+            current_effective_gid(),
+        )
+        .expect_err("wrong owner must fail");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("owner mismatch"));
+
+        let _ = fs::remove_dir(&runtime_dir);
+    }
+
+    #[test]
+    fn runtime_directory_validation_accepts_expected_owner_and_mode() {
+        let runtime_dir = temp_runtime_dir("runtime-valid");
+        validate_runtime_directory_for_ids(
+            &runtime_dir,
+            current_effective_uid(),
+            current_effective_gid(),
+        )
+        .expect("trusted runtime dir must pass");
+
+        let _ = fs::remove_dir(&runtime_dir);
+    }
+
+    #[test]
+    fn bind_rejects_stale_regular_file_at_socket_path() {
+        let socket_path = temp_socket_path("stale-file");
+        let runtime_dir = socket_path.parent().expect("runtime dir");
+        fs::create_dir_all(runtime_dir).expect("create runtime dir");
+        fs::set_permissions(
+            runtime_dir,
+            fs::Permissions::from_mode(RUNTIME_DIRECTORY_MODE),
+        )
+        .expect("chmod runtime dir");
+        fs::write(&socket_path, "not-a-socket").expect("write stale file");
+
+        let error = IpcServer::bind_for_test(socket_path.clone())
+            .expect_err("regular file must block startup");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("must be a unix socket"));
+
+        let _ = fs::remove_file(&socket_path);
+        let _ = fs::remove_dir(runtime_dir);
+    }
+
+    #[test]
+    fn socket_validation_rejects_unexpected_group() {
+        let socket_path = temp_socket_path("socket-group");
+        let server = IpcServer::bind_for_test(socket_path.clone()).expect("bind");
+
+        let error = validate_socket_file_for_ids(
+            server.socket_path(),
+            current_effective_uid(),
+            current_effective_gid().saturating_add(1),
+        )
+        .expect_err("wrong socket group must fail");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("group mismatch"));
+
         drop(server);
     }
 
@@ -708,12 +973,26 @@ mod tests {
     }
 
     fn temp_socket_path(name: &str) -> PathBuf {
+        let runtime_dir = temp_runtime_dir(name);
+        let mut path = runtime_dir;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        path.push(format!("adminbot-{nanos}.sock"));
+        path
+    }
+
+    fn temp_runtime_dir(name: &str) -> PathBuf {
         let mut path = env::temp_dir();
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time")
             .as_nanos();
-        path.push(format!("adminbot-{name}-{nanos}.sock"));
+        path.push(format!("adminbot-runtime-{name}-{nanos}"));
+        fs::create_dir_all(&path).expect("create runtime dir");
+        fs::set_permissions(&path, fs::Permissions::from_mode(RUNTIME_DIRECTORY_MODE))
+            .expect("chmod runtime dir");
         path
     }
 

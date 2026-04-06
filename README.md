@@ -60,8 +60,10 @@ Der Daemon erwartet standardmäßig:
 Vor dem Start:
 
 ```bash
-sudo install -d -m 0755 /run/adminbot
+sudo install -d -o adminbot -g adminbot -m 0750 /run/adminbot
 ```
+
+`adminbotd` startet fail closed, wenn `/run/adminbot` nicht das erwartete Runtime-Verzeichnis ist oder wenn unter `/run/adminbot/adminbot.sock` ein unsicheres Alt-Artefakt liegt.
 
 Dann:
 

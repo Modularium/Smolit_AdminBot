@@ -259,6 +259,16 @@ Nicht fuer Autorisierung vertrauenswuerdig in `v1.x`:
   - world-writable ist
   - kein regulaeres File ist
 
+### Deployment-Invariante fuer Runtime-Verzeichnis und Socket
+
+- `/run/adminbot` ist ein sicherheitskritisches Laufzeit-Artefakt
+- `adminbotd` startet fail closed, wenn
+  - `/run/adminbot` nicht als echtes Verzeichnis vorliegt
+  - Owner oder Gruppe nicht zur Service-Identitaet passen
+  - der Modus nicht `0750` ist
+  - unter `/run/adminbot/adminbot.sock` ein nicht vertrauenswuerdiges Alt-Artefakt liegt
+- der Socket selbst muss nach dem Bind als Unix-Socket mit Owner `adminbot`, Gruppe `adminbotctl` und Modus `0660` vorliegen
+
 ### `actions`
 
 Globale Positivliste für den Daemon.

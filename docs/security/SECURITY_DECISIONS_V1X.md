@@ -89,7 +89,7 @@ Dieses Dokument haelt die sicherheitsrelevanten Entscheidungen fuer die Nachhaer
 
 - Prioritaet: `P1`
 - GitHub-Issue: `#81`
-- Entscheidung: `/run/adminbot`, Socket-Datei und zugehoerige Besitz-/Modusannahmen werden beim Start oder frueh in der Laufzeit geprueft.
+- Entscheidung: `/run/adminbot`, Socket-Datei und zugehoerige Besitz-/Modusannahmen werden beim Start fail closed geprueft. Erwartet werden ein echtes Runtime-Verzeichnis mit Modus `0750`, ein Unix-Socket mit Modus `0660` sowie keine unsicheren Alt-Artefakte am Socket-Pfad.
 - Begruendung: lokale IPC-Sicherheit ist stark vom korrekten Deployment der Laufzeitartefakte abhaengig.
 - Nicht Ziel: Ersatz von systemd fuer Socket-Management.
 
