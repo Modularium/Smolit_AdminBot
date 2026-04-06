@@ -36,7 +36,7 @@
 [x] Socket-Read-Timeouts mit konservativem Default von `1000 ms` definieren
 [x] Socket-Write-Timeouts mit konservativem Default von `1000 ms` definieren
 [ ] Schutz gegen Slow-Client-Blockade definieren
-[ ] Request-Flooding und lokale Admission-Control bewerten
+[x] lokale Admission-Control gegen Burst-Flooding mit Fenster `8 Verbindungen / 1000 ms` aktivieren
 [ ] Replay-Schutz fuer mutierende Requests explizit bewerten
 [ ] `requested_by` staerker an echte lokale Identitaet binden
 
