@@ -65,7 +65,7 @@ Dieses Dokument haelt die sicherheitsrelevanten Entscheidungen fuer die Nachhaer
 
 - Prioritaet: `P1`
 - GitHub-Issue: `#78`
-- Entscheidung: modellierte Mutationsgrenzen muessen in der Laufzeit Wirkung entfalten.
+- Entscheidung: modellierte Mutationsgrenzen muessen in der Laufzeit Wirkung entfalten. `max_parallel_mutations` wird fuer mutierende Non-Dry-Run-Requests fail-fast mit `rate_limited` erzwungen.
 - Begruendung: Sicherheitsmodelle ohne technische Erzwingung sind fuer Missbrauchskontrolle zu schwach.
 - Nicht Ziel: aggressive Parallelisierung der gesamten Architektur.
 
