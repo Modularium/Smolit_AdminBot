@@ -9,7 +9,7 @@ use serde::Deserialize;
 use crate::actions::ActionMetadata;
 use crate::error::{AppError, AppResult, ErrorCode};
 use crate::peer::{gid_from_group_name, PeerCredentials};
-use crate::types::Request;
+use crate::types::{Request, RequestOriginType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -38,6 +38,8 @@ struct PolicyFile {
 struct ClientRule {
     unix_user: Option<String>,
     unix_group: Option<String>,
+    #[serde(default)]
+    allowed_request_types: Vec<RequestOriginType>,
     #[serde(default)]
     allowed_capabilities: Vec<Capability>,
 }
@@ -108,6 +110,7 @@ struct ClientEntry {
     unix_user: Option<String>,
     unix_group: Option<String>,
     group_gid: Option<u32>,
+    allowed_request_types: HashSet<RequestOriginType>,
     allowed_capabilities: HashSet<Capability>,
 }
 
@@ -144,6 +147,7 @@ impl PolicyEngine {
                 unix_user: client.unix_user,
                 unix_group: client.unix_group,
                 group_gid,
+                allowed_request_types: client.allowed_request_types.into_iter().collect(),
                 allowed_capabilities: client.allowed_capabilities.into_iter().collect(),
             });
         }
@@ -197,7 +201,7 @@ impl PolicyEngine {
             );
         }
 
-        let capabilities = self.capabilities_for_peer(peer)?;
+        let capabilities = self.capabilities_for_request_peer(request, peer)?;
         if !capabilities.contains(&metadata.required_capability) {
             return Err(
                 AppError::new(ErrorCode::CapabilityDenied, "required capability missing")
@@ -267,7 +271,11 @@ impl PolicyEngine {
             .push(now);
     }
 
-    fn capabilities_for_peer(&self, peer: &PeerCredentials) -> AppResult<HashSet<Capability>> {
+    fn capabilities_for_request_peer(
+        &self,
+        request: &Request,
+        peer: &PeerCredentials,
+    ) -> AppResult<HashSet<Capability>> {
         let gids = peer.all_gids();
         let mut capabilities = HashSet::new();
         let mut matched = false;
@@ -286,6 +294,15 @@ impl PolicyEngine {
                     current_match = true;
                 }
             } else if client.unix_group.is_some() {
+                current_match = false;
+            }
+
+            if current_match
+                && !client.allowed_request_types.is_empty()
+                && !client
+                    .allowed_request_types
+                    .contains(&request.requested_by.origin_type)
+            {
                 current_match = false;
             }
 
@@ -329,7 +346,10 @@ mod tests {
     use std::process;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use crate::actions;
     use crate::error::ErrorCode;
+    use crate::peer::PeerCredentials;
+    use crate::types::{Request, RequestOriginType, RequestedBy};
 
     fn write_policy_file(contents: &str) -> PathBuf {
         let timestamp = SystemTime::now()
@@ -448,5 +468,122 @@ allowed = ["system.status"]
         let message = error.to_string();
         assert!(message.contains("unknown field"));
         assert!(message.contains("unexpected_field"));
+    }
+
+    #[test]
+    fn authorize_returns_capability_denied_when_capability_is_missing() {
+        let path = write_policy_file(
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "dev"
+allowed_capabilities = ["read_basic"]
+
+[actions]
+allowed = ["service.status"]
+"#,
+        );
+
+        let engine = PolicyEngine::load_from_path(path.clone()).expect("load policy");
+        remove_policy_file(&path);
+
+        let request = Request {
+            version: 1,
+            request_id: "b398e7a0-ae50-4a60-aef1-8e7b38eb84cf".to_string(),
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Human,
+                id: "local-cli".to_string(),
+            },
+            action: "service.status".to_string(),
+            params: serde_json::Map::new(),
+            dry_run: false,
+            timeout_ms: 3000,
+        };
+        let metadata = actions::metadata(&request.action).expect("metadata");
+        let peer = PeerCredentials {
+            uid: 1000,
+            gid: 1000,
+            pid: 1,
+            supplementary_gids: Vec::new(),
+            unix_user: Some("dev".to_string()),
+        };
+
+        let error = engine
+            .authorize(&request, &metadata, &peer)
+            .expect_err("capability denied");
+        assert_eq!(error.code, ErrorCode::CapabilityDenied);
+    }
+
+    #[test]
+    fn authorize_can_restrict_human_and_agent_requests_differently() {
+        let path = write_policy_file(
+            r#"
+version = 1
+
+[clients.human_cli]
+unix_user = "dev"
+allowed_request_types = ["human"]
+allowed_capabilities = ["service_control"]
+
+[clients.agent_cli]
+unix_user = "dev"
+allowed_request_types = ["agent"]
+allowed_capabilities = ["read_basic"]
+
+[actions]
+allowed = ["service.restart"]
+
+[service_control]
+allowed_units = ["nginx.service"]
+"#,
+        );
+
+        let engine = PolicyEngine::load_from_path(path.clone()).expect("load policy");
+        remove_policy_file(&path);
+
+        let metadata = actions::metadata("service.restart").expect("metadata");
+        let peer = PeerCredentials {
+            uid: 1000,
+            gid: 1000,
+            pid: 1,
+            supplementary_gids: Vec::new(),
+            unix_user: Some("dev".to_string()),
+        };
+
+        let human_request = Request {
+            version: 1,
+            request_id: "adf4db77-6f76-4ff2-aa21-3ef7f2d8ff92".to_string(),
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Human,
+                id: "human-cli".to_string(),
+            },
+            action: "service.restart".to_string(),
+            params: serde_json::Map::new(),
+            dry_run: true,
+            timeout_ms: 3000,
+        };
+
+        let agent_request = Request {
+            version: 1,
+            request_id: "5f507fc6-d61f-4c45-b40f-d9fd253d2052".to_string(),
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Agent,
+                id: "agentnn-adminbot-agent".to_string(),
+            },
+            action: "service.restart".to_string(),
+            params: serde_json::Map::new(),
+            dry_run: true,
+            timeout_ms: 3000,
+        };
+
+        engine
+            .authorize(&human_request, &metadata, &peer)
+            .expect("human request should be allowed");
+
+        let error = engine
+            .authorize(&agent_request, &metadata, &peer)
+            .expect_err("agent should not get service_control");
+        assert_eq!(error.code, ErrorCode::CapabilityDenied);
     }
 }
