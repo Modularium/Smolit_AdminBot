@@ -702,6 +702,63 @@ allowed_mounts = ["/definitely-missing-adminbot-mount"]
         }
     }
 
+    #[test]
+    fn process_snapshot_returns_small_stable_shape() {
+        let app = App::new(policy_for_current_user(
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "__USER__"
+allowed_capabilities = ["read_sensitive"]
+
+[actions]
+allowed = ["process.snapshot"]
+denied = []
+
+[constraints]
+process_limit_max = 10
+"#,
+        ));
+
+        let request = Request {
+            version: 1,
+            request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62583".to_string(),
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Human,
+                id: "test-cli".to_string(),
+            },
+            action: "process.snapshot".to_string(),
+            params: serde_json::from_value(json!({
+                "top_by": "memory",
+                "limit": 5
+            }))
+            .expect("params"),
+            dry_run: false,
+            timeout_ms: 3000,
+        };
+
+        let response = app.handle_request(request, current_peer());
+        match response {
+            Response::Success(success) => {
+                let processes = success.result["processes"]
+                    .as_array()
+                    .expect("processes array");
+                assert!(!processes.is_empty());
+                assert!(processes.len() <= 5);
+
+                for process in processes {
+                    assert!(process["pid"].is_u64());
+                    assert!(process["name"].as_str().is_some());
+                    assert!(process["cpu_percent"].is_number());
+                    assert!(process["memory_percent"].is_number());
+                    assert!(process["started_at"].as_str().is_some());
+                }
+            }
+            Response::Error(error) => panic!("unexpected error response: {:?}", error),
+        }
+    }
+
     fn current_peer() -> PeerCredentials {
         PeerCredentials {
             uid: unsafe { libc::geteuid() },
