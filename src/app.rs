@@ -1,23 +1,77 @@
+use std::sync::Mutex;
+
 use serde_json::Value;
 
-use crate::actions;
+use crate::actions::{self, ActionHandler, ActionMetadata};
 use crate::audit::AuditLogger;
-use crate::error::AppError;
+use crate::error::{AppError, ErrorCode};
 use crate::peer::PeerCredentials;
 use crate::policy::PolicyEngine;
 use crate::types::{Request, Response};
 
 #[derive(Debug)]
+struct MutationLimiter {
+    max_parallel_mutations: usize,
+    active_mutations: Mutex<usize>,
+}
+
+#[derive(Debug)]
+struct MutationPermit<'a> {
+    limiter: &'a MutationLimiter,
+}
+
+#[derive(Debug)]
 pub struct App {
     policy: PolicyEngine,
     audit: AuditLogger,
+    mutation_limiter: MutationLimiter,
+}
+
+impl MutationLimiter {
+    fn new(max_parallel_mutations: u32) -> Self {
+        Self {
+            max_parallel_mutations: max_parallel_mutations.max(1) as usize,
+            active_mutations: Mutex::new(0),
+        }
+    }
+
+    fn try_acquire(&self) -> Result<MutationPermit<'_>, AppError> {
+        let mut active = self
+            .active_mutations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *active >= self.max_parallel_mutations {
+            return Err(AppError::new(
+                ErrorCode::RateLimited,
+                "maximum parallel mutating actions exceeded",
+            )
+            .with_detail("max_parallel_mutations", self.max_parallel_mutations as u64)
+            .retryable(true));
+        }
+
+        *active += 1;
+        Ok(MutationPermit { limiter: self })
+    }
+}
+
+impl Drop for MutationPermit<'_> {
+    fn drop(&mut self) {
+        let mut active = self
+            .limiter
+            .active_mutations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *active = active.saturating_sub(1);
+    }
 }
 
 impl App {
     pub fn new(policy: PolicyEngine) -> Self {
+        let mutation_limiter = MutationLimiter::new(policy.constraints().max_parallel_mutations);
         Self {
             policy,
             audit: AuditLogger,
+            mutation_limiter,
         }
     }
 
@@ -42,8 +96,30 @@ impl App {
     fn execute(&self, request: &Request, peer: &PeerCredentials) -> Result<Value, AppError> {
         let metadata = actions::validate_request_shape(request, self)?;
         self.policy.authorize(request, &metadata, peer)?;
+        let _mutation_permit = self.try_acquire_mutation_permit(request, &metadata)?;
         actions::execute(self, request)
     }
+
+    fn try_acquire_mutation_permit<'a>(
+        &'a self,
+        request: &Request,
+        metadata: &ActionMetadata,
+    ) -> Result<Option<MutationPermit<'a>>, AppError> {
+        if requires_mutation_permit(request, metadata) {
+            return self.mutation_limiter.try_acquire().map(Some);
+        }
+
+        Ok(None)
+    }
+
+    #[cfg(test)]
+    fn hold_mutation_slot_for_test(&self) -> Result<MutationPermit<'_>, AppError> {
+        self.mutation_limiter.try_acquire()
+    }
+}
+
+fn requires_mutation_permit(request: &Request, metadata: &ActionMetadata) -> bool {
+    !request.dry_run && matches!(metadata.handler, ActionHandler::ServiceRestart)
 }
 
 #[cfg(test)]
@@ -51,6 +127,8 @@ mod tests {
     use std::env;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
@@ -189,6 +267,92 @@ max_restarts_per_hour = 3
             }
             Response::Error(error) => panic!("unexpected error response: {:?}", error),
         }
+    }
+
+    #[test]
+    fn mutation_limiter_allows_up_to_configured_parallel_limit() {
+        let app = App::new(service_restart_policy_with_parallel_limit(
+            "nginx.service",
+            2,
+        ));
+
+        let first = app.hold_mutation_slot_for_test().expect("first slot");
+        let second = app.hold_mutation_slot_for_test().expect("second slot");
+        let error = app
+            .hold_mutation_slot_for_test()
+            .expect_err("third slot must fail");
+        assert_eq!(error.code, crate::error::ErrorCode::RateLimited);
+        assert_eq!(error.details.get("max_parallel_mutations"), Some(&json!(2)));
+
+        drop(first);
+        let third = app
+            .hold_mutation_slot_for_test()
+            .expect("slot should be released after drop");
+        drop(third);
+        drop(second);
+    }
+
+    #[test]
+    fn service_restart_is_rejected_when_mutation_limit_is_exhausted() {
+        let unit = "nginx.service";
+        let app = App::new(service_restart_policy_with_parallel_limit(unit, 1));
+        let _permit = app
+            .hold_mutation_slot_for_test()
+            .expect("hold mutation slot");
+
+        let response = app.handle_request(service_restart_request(unit, false), current_peer());
+        match response {
+            Response::Error(error) => {
+                assert_eq!(error.error.code, crate::error::ErrorCode::RateLimited);
+                assert_eq!(
+                    error.error.details.get("max_parallel_mutations"),
+                    Some(&json!(1))
+                );
+                assert_eq!(error.error.retryable, true);
+            }
+            Response::Success(success) => panic!("unexpected success response: {:?}", success),
+        }
+    }
+
+    #[test]
+    fn parallel_mutation_requests_over_limit_are_rejected() {
+        let unit = "nginx.service";
+        let app = Arc::new(App::new(service_restart_policy_with_parallel_limit(
+            unit, 1,
+        )));
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let app = Arc::clone(&app);
+            let barrier = Arc::clone(&barrier);
+            handles.push(thread::spawn(move || {
+                let _permit = app.hold_mutation_slot_for_test().ok();
+                barrier.wait();
+                let response =
+                    app.handle_request(service_restart_request(unit, false), current_peer());
+                barrier.wait();
+                response
+            }));
+        }
+
+        barrier.wait();
+        barrier.wait();
+
+        let mut codes = Vec::new();
+        for handle in handles {
+            match handle.join().expect("thread join") {
+                Response::Error(error) => {
+                    codes.push(error.error.code);
+                }
+                Response::Success(success) => panic!("unexpected success response: {:?}", success),
+            }
+        }
+
+        assert_eq!(codes.len(), 2);
+        assert!(codes
+            .into_iter()
+            .all(|code| code == crate::error::ErrorCode::RateLimited));
     }
 
     #[test]
@@ -826,6 +990,13 @@ process_limit_max = 10
     }
 
     fn service_restart_policy_for_current_user(unit: &str) -> PolicyEngine {
+        service_restart_policy_with_parallel_limit(unit, 1)
+    }
+
+    fn service_restart_policy_with_parallel_limit(
+        unit: &str,
+        max_parallel_mutations: u32,
+    ) -> PolicyEngine {
         let template = format!(
             r#"
 version = 1
@@ -842,6 +1013,9 @@ denied = []
 allowed_units = ["{unit}"]
 restart_cooldown_seconds = 300
 max_restarts_per_hour = 3
+
+[constraints]
+max_parallel_mutations = {max_parallel_mutations}
 "#
         );
 

@@ -280,6 +280,7 @@ Globale Positivliste für den Daemon.
 ### `constraints`
 
 - globale technische Limits
+- `max_parallel_mutations` wird fuer mutierende Non-Dry-Run-Requests aktiv zur Laufzeit erzwungen
 - keine komplexe Regelsprache in `v1`
 
 ## Privilegierte Aktionsklassen
