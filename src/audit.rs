@@ -1,4 +1,7 @@
+use std::collections::HashMap;
 use std::ffi::CString;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use libc::iovec;
 use serde_json::json;
@@ -8,8 +11,13 @@ use crate::error::AppError;
 use crate::peer::PeerCredentials;
 use crate::types::Request;
 
-#[derive(Debug, Default)]
-pub struct AuditLogger;
+pub const AUDIT_REPETITIVE_ERROR_WINDOW: Duration = Duration::from_secs(1);
+pub const AUDIT_REPETITIVE_ERROR_BURST_LIMIT: usize = 4;
+
+#[derive(Debug)]
+pub struct AuditLogger {
+    flood_control: Mutex<AuditFloodControl>,
+}
 
 #[derive(Debug, Clone, Copy)]
 enum AuditDecision {
@@ -34,9 +42,43 @@ struct AuditEvent<'a> {
     error: Option<&'a AppError>,
 }
 
+#[derive(Debug)]
+enum AuditEmission {
+    Emit { suppression_notice: bool },
+    Suppress,
+}
+
+#[derive(Debug, Default)]
+struct AuditFloodControl {
+    repetitive_error_windows: HashMap<AuditFloodKey, AuditFloodWindow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct AuditFloodKey {
+    peer_uid: u32,
+    peer_gid: u32,
+    action: String,
+    error_code: String,
+}
+
+#[derive(Debug)]
+struct AuditFloodWindow {
+    window_started: Instant,
+    emitted_events: usize,
+    suppression_notice_emitted: bool,
+}
+
 #[link(name = "systemd")]
 unsafe extern "C" {
     fn sd_journal_sendv(iov: *const iovec, n: libc::c_int) -> libc::c_int;
+}
+
+impl Default for AuditLogger {
+    fn default() -> Self {
+        Self {
+            flood_control: Mutex::new(AuditFloodControl::default()),
+        }
+    }
 }
 
 impl AuditLogger {
@@ -49,7 +91,7 @@ impl AuditLogger {
             result: "received",
             error: None,
         };
-        self.log_event(&event);
+        self.log_event(&event, Instant::now());
     }
 
     pub fn log_success(&self, request: &Request, peer: &PeerCredentials) {
@@ -61,7 +103,7 @@ impl AuditLogger {
             result: success_result(request),
             error: None,
         };
-        self.log_event(&event);
+        self.log_event(&event, Instant::now());
     }
 
     pub fn log_error(&self, request: &Request, peer: &PeerCredentials, error: &AppError) {
@@ -73,18 +115,68 @@ impl AuditLogger {
             result: "error",
             error: Some(error),
         };
-        self.log_event(&event);
+        self.log_event(&event, Instant::now());
     }
 
-    fn log_event(&self, event: &AuditEvent<'_>) {
-        let fields = build_journald_fields(event);
+    fn log_event(&self, event: &AuditEvent<'_>, now: Instant) {
+        let emission = self.evaluate_flood_control(event, now);
+        let suppression_notice = match emission {
+            AuditEmission::Emit { suppression_notice } => suppression_notice,
+            AuditEmission::Suppress => return,
+        };
+
+        let fields = build_journald_fields(event, suppression_notice);
         if send_to_journald(&fields).is_err() {
-            eprintln!("{}", fallback_json(event));
+            eprintln!("{}", fallback_json(event, suppression_notice));
         }
+    }
+
+    fn evaluate_flood_control(&self, event: &AuditEvent<'_>, now: Instant) -> AuditEmission {
+        if !is_repetitive_error_candidate(event) {
+            return AuditEmission::Emit {
+                suppression_notice: false,
+            };
+        }
+
+        let key = repetitive_error_key(event);
+        let mut guard = self
+            .flood_control
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let window = guard
+            .repetitive_error_windows
+            .entry(key)
+            .or_insert_with(|| AuditFloodWindow {
+                window_started: now,
+                emitted_events: 0,
+                suppression_notice_emitted: false,
+            });
+
+        if now.duration_since(window.window_started) >= AUDIT_REPETITIVE_ERROR_WINDOW {
+            window.window_started = now;
+            window.emitted_events = 0;
+            window.suppression_notice_emitted = false;
+        }
+
+        if window.emitted_events < AUDIT_REPETITIVE_ERROR_BURST_LIMIT {
+            window.emitted_events += 1;
+            return AuditEmission::Emit {
+                suppression_notice: false,
+            };
+        }
+
+        if !window.suppression_notice_emitted {
+            window.suppression_notice_emitted = true;
+            return AuditEmission::Emit {
+                suppression_notice: true,
+            };
+        }
+
+        AuditEmission::Suppress
     }
 }
 
-fn build_journald_fields(event: &AuditEvent<'_>) -> Vec<CString> {
+fn build_journald_fields(event: &AuditEvent<'_>, suppression_notice: bool) -> Vec<CString> {
     let access = access_decisions(event);
     let mut fields = vec![
         cstring_field("MESSAGE", &format_message(event)),
@@ -108,6 +200,18 @@ fn build_journald_fields(event: &AuditEvent<'_>) -> Vec<CString> {
         cstring_field("ADMINBOT_CAPABILITY_DECISION", access.capability),
         cstring_field("ADMINBOT_RESULT", event.result),
     ];
+
+    if suppression_notice {
+        fields.push(cstring_field("ADMINBOT_AUDIT_SUPPRESSION_ACTIVE", "true"));
+        fields.push(cstring_field(
+            "ADMINBOT_AUDIT_SUPPRESSION_WINDOW_MS",
+            &AUDIT_REPETITIVE_ERROR_WINDOW.as_millis().to_string(),
+        ));
+        fields.push(cstring_field(
+            "ADMINBOT_AUDIT_SUPPRESSION_BURST_LIMIT",
+            &AUDIT_REPETITIVE_ERROR_BURST_LIMIT.to_string(),
+        ));
+    }
 
     if let Some(error) = event.error {
         fields.push(cstring_field(
@@ -147,7 +251,7 @@ fn send_to_journald(fields: &[CString]) -> Result<(), ()> {
     Ok(())
 }
 
-fn fallback_json(event: &AuditEvent<'_>) -> serde_json::Value {
+fn fallback_json(event: &AuditEvent<'_>, suppression_notice: bool) -> serde_json::Value {
     let access = access_decisions(event);
     let mut entry = json!({
         "request_id": event.request.request_id,
@@ -173,6 +277,14 @@ fn fallback_json(event: &AuditEvent<'_>) -> serde_json::Value {
         "result": event.result
     });
 
+    if suppression_notice {
+        entry["audit"] = json!({
+            "suppression_active": true,
+            "suppression_window_ms": AUDIT_REPETITIVE_ERROR_WINDOW.as_millis(),
+            "suppression_burst_limit": AUDIT_REPETITIVE_ERROR_BURST_LIMIT
+        });
+    }
+
     if let Some(error) = event.error {
         entry["error"] = json!({
             "code": error.code,
@@ -189,6 +301,29 @@ fn fallback_json(event: &AuditEvent<'_>) -> serde_json::Value {
     }
 
     entry
+}
+
+fn is_repetitive_error_candidate(event: &AuditEvent<'_>) -> bool {
+    matches!(
+        event.error.map(|error| error.code),
+        Some(crate::error::ErrorCode::ValidationError)
+            | Some(crate::error::ErrorCode::UnsupportedVersion)
+            | Some(crate::error::ErrorCode::Unauthorized)
+            | Some(crate::error::ErrorCode::Forbidden)
+    )
+}
+
+fn repetitive_error_key(event: &AuditEvent<'_>) -> AuditFloodKey {
+    let error_code = event
+        .error
+        .map(|error| error.code.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    AuditFloodKey {
+        peer_uid: event.peer.uid,
+        peer_gid: event.peer.gid,
+        action: event.request.action.clone(),
+        error_code,
+    }
 }
 
 fn cstring_field(key: &str, value: &str) -> CString {
@@ -326,7 +461,7 @@ mod tests {
             error: None,
         };
 
-        let fields = build_journald_fields(&event)
+        let fields = build_journald_fields(&event, false)
             .into_iter()
             .map(|field| field.into_string().expect("utf8"))
             .collect::<Vec<_>>();
@@ -356,7 +491,7 @@ mod tests {
             error: None,
         };
 
-        let fields = build_journald_fields(&event)
+        let fields = build_journald_fields(&event, false)
             .into_iter()
             .map(|field| field.into_string().expect("utf8"))
             .collect::<Vec<_>>();
@@ -382,7 +517,7 @@ mod tests {
             error: Some(&error),
         };
 
-        let fields = build_journald_fields(&event)
+        let fields = build_journald_fields(&event, false)
             .into_iter()
             .map(|field| field.into_string().expect("utf8"))
             .collect::<Vec<_>>();
@@ -410,7 +545,7 @@ mod tests {
             error: Some(&error),
         };
 
-        let fields = build_journald_fields(&event)
+        let fields = build_journald_fields(&event, false)
             .into_iter()
             .map(|field| field.into_string().expect("utf8"))
             .collect::<Vec<_>>();
@@ -436,7 +571,7 @@ mod tests {
             error: Some(&error),
         };
 
-        let fields = build_journald_fields(&event)
+        let fields = build_journald_fields(&event, false)
             .into_iter()
             .map(|field| field.into_string().expect("utf8"))
             .collect::<Vec<_>>();
@@ -467,7 +602,7 @@ mod tests {
             error: Some(&error),
         };
 
-        let json = fallback_json(&event);
+        let json = fallback_json(&event, false);
         assert_eq!(json["request_id"], "test-request-id");
         assert_eq!(json["action"], "system.status");
         assert_eq!(json["stage"], "completed");
@@ -478,6 +613,133 @@ mod tests {
         assert_eq!(json["result"], "error");
         assert_eq!(json["error"]["code"], "execution_failed");
         assert_eq!(json["error"]["message"], "write failed");
+    }
+
+    #[test]
+    fn repetitive_invalid_request_errors_are_suppressed_after_burst_limit() {
+        let logger = AuditLogger::default();
+        let request = test_request();
+        let peer = test_peer();
+        let error = AppError::new(ErrorCode::ValidationError, "invalid request payload");
+        let event = AuditEvent {
+            request: &request,
+            peer: &peer,
+            stage: AuditStage::Completed,
+            decision: AuditDecision::Deny,
+            result: "error",
+            error: Some(&error),
+        };
+        let now = Instant::now();
+
+        for offset in 0..AUDIT_REPETITIVE_ERROR_BURST_LIMIT {
+            let emission =
+                logger.evaluate_flood_control(&event, now + Duration::from_millis(offset as u64));
+            assert!(matches!(
+                emission,
+                AuditEmission::Emit {
+                    suppression_notice: false
+                }
+            ));
+        }
+
+        let suppression_notice = logger.evaluate_flood_control(
+            &event,
+            now + Duration::from_millis(AUDIT_REPETITIVE_ERROR_BURST_LIMIT as u64),
+        );
+        assert!(matches!(
+            suppression_notice,
+            AuditEmission::Emit {
+                suppression_notice: true
+            }
+        ));
+
+        let suppressed = logger.evaluate_flood_control(
+            &event,
+            now + Duration::from_millis((AUDIT_REPETITIVE_ERROR_BURST_LIMIT + 1) as u64),
+        );
+        assert!(matches!(suppressed, AuditEmission::Suppress));
+    }
+
+    #[test]
+    fn repetitive_error_suppression_resets_after_window() {
+        let logger = AuditLogger::default();
+        let request = test_request();
+        let peer = test_peer();
+        let error = AppError::new(ErrorCode::ValidationError, "invalid request payload");
+        let event = AuditEvent {
+            request: &request,
+            peer: &peer,
+            stage: AuditStage::Completed,
+            decision: AuditDecision::Deny,
+            result: "error",
+            error: Some(&error),
+        };
+        let now = Instant::now();
+
+        for offset in 0..=AUDIT_REPETITIVE_ERROR_BURST_LIMIT {
+            let _ =
+                logger.evaluate_flood_control(&event, now + Duration::from_millis(offset as u64));
+        }
+
+        let emission = logger.evaluate_flood_control(&event, now + AUDIT_REPETITIVE_ERROR_WINDOW);
+        assert!(matches!(
+            emission,
+            AuditEmission::Emit {
+                suppression_notice: false
+            }
+        ));
+    }
+
+    #[test]
+    fn success_events_are_never_subject_to_repetitive_error_suppression() {
+        let logger = AuditLogger::default();
+        let request = test_request();
+        let peer = test_peer();
+        let event = AuditEvent {
+            request: &request,
+            peer: &peer,
+            stage: AuditStage::Completed,
+            decision: AuditDecision::Allow,
+            result: "ok",
+            error: None,
+        };
+
+        for offset in 0..10_u64 {
+            let emission = logger
+                .evaluate_flood_control(&event, Instant::now() + Duration::from_millis(offset));
+            assert!(matches!(
+                emission,
+                AuditEmission::Emit {
+                    suppression_notice: false
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn suppression_notice_is_encoded_in_fallback_json() {
+        let request = test_request();
+        let peer = test_peer();
+        let error = AppError::new(ErrorCode::ValidationError, "invalid request payload");
+        let event = AuditEvent {
+            request: &request,
+            peer: &peer,
+            stage: AuditStage::Completed,
+            decision: AuditDecision::Deny,
+            result: "error",
+            error: Some(&error),
+        };
+
+        let json = fallback_json(&event, true);
+        assert_eq!(json["audit"]["suppression_active"], true);
+        assert_eq!(
+            json["audit"]["suppression_burst_limit"],
+            AUDIT_REPETITIVE_ERROR_BURST_LIMIT
+        );
+        assert_eq!(
+            json["audit"]["suppression_window_ms"],
+            json!(AUDIT_REPETITIVE_ERROR_WINDOW.as_millis())
+        );
     }
 
     fn test_request() -> Request {

@@ -73,7 +73,7 @@ Dieses Dokument haelt die sicherheitsrelevanten Entscheidungen fuer die Nachhaer
 
 - Prioritaet: `P1`
 - GitHub-Issue: `#79`
-- Entscheidung: wiederholte invalide oder missbrauchsartige Requests duerfen den Audit-Kanal nicht dominieren.
+- Entscheidung: wiederholte invalide oder missbrauchsartige Requests duerfen den Audit-Kanal nicht dominieren. Repetitive Boundary-Fehler (`validation_error`, `unsupported_version`, `unauthorized`, `forbidden`) werden deshalb pro Peer/Action in einem festen Fenster von `1000 ms` nach `4` Audit-Emissionen gedrosselt; beim Eintritt in die Unterdrueckung wird genau ein Suppressionshinweis emittiert.
 - Begruendung: Sichtbarkeit fuer echte Vorfaelle darf nicht durch triviales Flooding verloren gehen.
 - Nicht Ziel: Entfernung sicherheitsrelevanter Audit-Daten.
 
