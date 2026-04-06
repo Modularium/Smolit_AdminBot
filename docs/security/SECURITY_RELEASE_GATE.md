@@ -83,16 +83,27 @@ Mindestens diese Zeilen muessen in `adminbotd.service` vorhanden sein:
 - `RuntimeDirectory=adminbot`
 - `RuntimeDirectoryMode=0750`
 - `ExecStart=/usr/local/bin/adminbotd`
+- `UMask=0077`
 - `NoNewPrivileges=true`
 - `PrivateTmp=true`
 - `PrivateDevices=true`
 - `ProtectSystem=strict`
 - `ProtectHome=true`
+- `ProtectClock=true`
+- `ProtectHostname=true`
+- `ProtectControlGroups=true`
+- `ProtectKernelTunables=true`
+- `ProtectKernelModules=true`
+- `ProtectKernelLogs=true`
 - `MemoryDenyWriteExecute=true`
 - `RestrictRealtime=true`
+- `RestrictSUIDSGID=true`
+- `RestrictNamespaces=true`
 - `LockPersonality=true`
+- `SystemCallArchitectures=native`
 - `CapabilityBoundingSet=`
 - `RestrictAddressFamilies=AF_UNIX`
+- `RemoveIPC=true`
 
 ### Runtime und Socket
 

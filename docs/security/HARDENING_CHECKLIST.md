@@ -8,20 +8,26 @@
 [x] `adminbotd.service` nutzt `PrivateDevices=true`
 [x] `adminbotd.service` nutzt `ProtectSystem=strict`
 [x] `adminbotd.service` nutzt `ProtectHome=true`
+[x] `adminbotd.service` nutzt `ProtectClock=true`
+[x] `adminbotd.service` nutzt `ProtectHostname=true`
+[x] `adminbotd.service` nutzt `ProtectControlGroups=true`
+[x] `adminbotd.service` nutzt `ProtectKernelTunables=true`
+[x] `adminbotd.service` nutzt `ProtectKernelModules=true`
+[x] `adminbotd.service` nutzt `ProtectKernelLogs=true`
 [x] `adminbotd.service` nutzt `MemoryDenyWriteExecute=true`
 [x] `adminbotd.service` nutzt `RestrictRealtime=true`
+[x] `adminbotd.service` nutzt `RestrictSUIDSGID=true`
+[x] `adminbotd.service` nutzt `RestrictNamespaces=true`
 [x] `adminbotd.service` nutzt `LockPersonality=true`
+[x] `adminbotd.service` nutzt `SystemCallArchitectures=native`
 [x] `adminbotd.service` nutzt leeres `CapabilityBoundingSet=`
 [x] `adminbotd.service` nutzt `RestrictAddressFamilies=AF_UNIX`
-[ ] `UMask=` fuer erzeugte Dateien und Sockets explizit festlegen
-[ ] `ProtectKernelTunables=` pruefen und falls moeglich aktivieren
-[ ] `ProtectKernelModules=` pruefen und falls moeglich aktivieren
-[ ] `ProtectKernelLogs=` pruefen und falls moeglich aktivieren
-[ ] `RestrictSUIDSGID=` pruefen und falls moeglich aktivieren
+[x] `adminbotd.service` nutzt `UMask=0077`
+[x] `adminbotd.service` nutzt `RemoveIPC=true`
 [ ] `ProtectProc=` und `ProcSubset=` pruefen
 [ ] `SystemCallFilter=` konservativ definieren
 [ ] `IPAddressDeny=` oder gleichwertige Netzrestriktion explizit pruefen
-[ ] `RemoveIPC=` und weitere Namespace-Restriktionen bewerten
+[ ] `PrivateNetwork=` gegen realen D-Bus-/Journald-Betrieb pruefen
 
 ## IPC und Request-Handling
 
