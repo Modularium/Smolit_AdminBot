@@ -385,6 +385,116 @@ denied = []
         }
     }
 
+    #[test]
+    fn resource_snapshot_returns_stable_typed_shape() {
+        let app = App::new(policy_for_current_user(
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "__USER__"
+allowed_capabilities = ["read_basic"]
+
+[actions]
+allowed = ["resource.snapshot"]
+denied = []
+"#,
+        ));
+
+        let request = Request {
+            version: 1,
+            request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62578".to_string(),
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Human,
+                id: "test-cli".to_string(),
+            },
+            action: "resource.snapshot".to_string(),
+            params: serde_json::from_value(json!({})).expect("params"),
+            dry_run: false,
+            timeout_ms: 3000,
+        };
+
+        let response = app.handle_request(request, current_peer());
+        match response {
+            Response::Success(success) => {
+                let timestamp = success.result["timestamp"].as_str().expect("timestamp");
+                let (date, time) = timestamp.split_once('T').expect("rfc3339 separator");
+                assert_eq!(date.len(), 10);
+                assert!(date.chars().enumerate().all(|(idx, ch)| match idx {
+                    4 | 7 => ch == '-',
+                    _ => ch.is_ascii_digit(),
+                }));
+                assert!(time.ends_with('Z'));
+
+                let load_average = success.result["cpu"]["load_average"]
+                    .as_array()
+                    .expect("cpu load_average");
+                assert_eq!(load_average.len(), 3);
+                assert!(load_average.iter().all(|value| value.is_number()));
+
+                assert!(success.result["memory"]["total_bytes"].is_u64());
+                assert!(success.result["memory"]["used_bytes"].is_u64());
+                assert!(success.result["memory"]["available_bytes"].is_u64());
+
+                assert!(success.result["swap"]["total_bytes"].is_u64());
+                assert!(success.result["swap"]["used_bytes"].is_u64());
+
+                assert!(success.result["disk"]["root"]["total_bytes"].is_u64());
+                assert!(success.result["disk"]["root"]["used_bytes"].is_u64());
+                assert!(success.result["disk"]["root"]["available_bytes"].is_u64());
+                assert!(success.result["disk"]["root"]["percent_used"].is_number());
+
+                assert!(success.result["net"]["rx_bytes"].is_u64());
+                assert!(success.result["net"]["tx_bytes"].is_u64());
+            }
+            Response::Error(error) => panic!("unexpected error response: {:?}", error),
+        }
+    }
+
+    #[test]
+    fn resource_snapshot_rejects_invalid_include_values() {
+        let app = App::new(policy_for_current_user(
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "__USER__"
+allowed_capabilities = ["read_basic"]
+
+[actions]
+allowed = ["resource.snapshot"]
+denied = []
+"#,
+        ));
+
+        let request = Request {
+            version: 1,
+            request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62579".to_string(),
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Human,
+                id: "test-cli".to_string(),
+            },
+            action: "resource.snapshot".to_string(),
+            params: serde_json::from_value(json!({
+                "include": ["cpu", "history"]
+            }))
+            .expect("params"),
+            dry_run: false,
+            timeout_ms: 3000,
+        };
+
+        let response = app.handle_request(request, current_peer());
+        match response {
+            Response::Error(error) => {
+                assert_eq!(
+                    serde_json::to_value(error.error.code).unwrap(),
+                    json!("validation_error")
+                );
+            }
+            Response::Success(success) => panic!("unexpected success response: {:?}", success),
+        }
+    }
+
     fn current_peer() -> PeerCredentials {
         PeerCredentials {
             uid: unsafe { libc::geteuid() },
