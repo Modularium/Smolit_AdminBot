@@ -57,6 +57,8 @@
 - `Agent-NN` erhält in `v1` weiterhin keine `service_control`-Capability
 - kein generischer Root-Helper im Standardpfad
 - Linux Capabilities sind nicht der primäre Mechanismus für `service.restart`
+- `requested_by.type` und `requested_by.id` sind in `v1.x` keine vertrauenswuerdige Autorisierungsquelle
+- Rollenunterschiede zwischen Human und Agent muessen ueber getrennte Unix-User oder Unix-Gruppen modelliert werden, nicht ueber selbstdeklarierte Request-Metadaten
 
 ## Bewertung der Service-Control-Optionen
 
@@ -238,6 +240,12 @@ Mögliche Match-Kriterien in `v1`:
 
 - `unix_user`
 - `unix_group`
+
+Nicht fuer Autorisierung vertrauenswuerdig in `v1.x`:
+
+- `requested_by.type`
+- `requested_by.id`
+- `allowed_request_types` als alleinige Rollentrennung fuer dieselbe OS-Identitaet
 
 ### `actions`
 

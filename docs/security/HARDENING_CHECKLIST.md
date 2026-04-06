@@ -38,7 +38,7 @@
 [ ] Schutz gegen Slow-Client-Blockade definieren
 [x] lokale Admission-Control gegen Burst-Flooding mit Fenster `8 Verbindungen / 1000 ms` aktivieren
 [ ] Replay-Schutz fuer mutierende Requests explizit bewerten
-[ ] `requested_by` staerker an echte lokale Identitaet binden
+[x] `requested_by.type` und `requested_by.id` nur noch als Audit-/Korrelation-Metadaten behandeln; Autorisierung folgt Peer-UID/GID und Policy-Match
 
 ## Policy und Autorisierung
 
@@ -52,7 +52,7 @@
 [x] Restart-Rate-Limit existiert
 [ ] Eigentuemer und Modus von `/etc/adminbot/policy.toml` beim Deployment hart pruefen
 [ ] Policy-Integritaet oder Change-Control dokumentieren
-[ ] `allowed_request_types` nur mit starker Client-Identitaetsbindung verwenden
+[x] `allowed_request_types` nicht mehr fuer Autorisierung verwenden; getrennte Unix-User oder -Gruppen fuer getrennte Rollen erzwingen
 [ ] `max_parallel_mutations` aktiv technisch erzwingen
 
 ## Action- und Backend-Sicherheit

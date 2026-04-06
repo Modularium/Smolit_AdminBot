@@ -120,7 +120,6 @@ struct ClientEntry {
     unix_user: Option<String>,
     unix_group: Option<String>,
     group_gid: Option<u32>,
-    allowed_request_types: HashSet<RequestOriginType>,
     allowed_capabilities: HashSet<Capability>,
 }
 
@@ -148,7 +147,18 @@ impl PolicyEngine {
         }
 
         let mut clients = Vec::new();
-        for (_, client) in parsed.clients {
+        for (client_name, client) in parsed.clients {
+            if !client.allowed_request_types.is_empty() {
+                return Err(Box::new(
+                    AppError::new(
+                        ErrorCode::ValidationError,
+                        "allowed_request_types is not trusted for authorization; use separate unix_user or unix_group bindings",
+                    )
+                    .with_detail("client", client_name)
+                    .with_detail("field", "clients.*.allowed_request_types"),
+                ));
+            }
+
             let group_gid = match client.unix_group.as_deref() {
                 Some(group_name) => gid_from_group_name(group_name)?,
                 None => None,
@@ -157,7 +167,6 @@ impl PolicyEngine {
                 unix_user: client.unix_user,
                 unix_group: client.unix_group,
                 group_gid,
-                allowed_request_types: client.allowed_request_types.into_iter().collect(),
                 allowed_capabilities: client.allowed_capabilities.into_iter().collect(),
             });
         }
@@ -305,7 +314,7 @@ impl PolicyEngine {
 
     fn capabilities_for_request_peer(
         &self,
-        request: &Request,
+        _request: &Request,
         peer: &PeerCredentials,
     ) -> AppResult<HashSet<Capability>> {
         let gids = peer.all_gids();
@@ -326,15 +335,6 @@ impl PolicyEngine {
                     current_match = true;
                 }
             } else if client.unix_group.is_some() {
-                current_match = false;
-            }
-
-            if current_match
-                && !client.allowed_request_types.is_empty()
-                && !client
-                    .allowed_request_types
-                    .contains(&request.requested_by.origin_type)
-            {
                 current_match = false;
             }
 
@@ -553,7 +553,7 @@ allowed = ["service.status"]
     }
 
     #[test]
-    fn authorize_can_restrict_human_and_agent_requests_differently() {
+    fn load_rejects_allowed_request_types_for_authorization() {
         let path = write_policy_file(
             r#"
 version = 1
@@ -563,10 +563,44 @@ unix_user = "dev"
 allowed_request_types = ["human"]
 allowed_capabilities = ["service_control"]
 
-[clients.agent_cli]
+[actions]
+allowed = ["service.restart"]
+
+[service_control]
+allowed_units = ["nginx.service"]
+"#,
+        );
+
+        let error = PolicyEngine::load_from_path(path.clone()).expect_err("policy must fail");
+        remove_policy_file(&path);
+
+        let app_error = error
+            .downcast_ref::<AppError>()
+            .expect("error should be AppError");
+        assert_eq!(app_error.code, ErrorCode::ValidationError);
+        assert_eq!(
+            app_error.message,
+            "allowed_request_types is not trusted for authorization; use separate unix_user or unix_group bindings"
+        );
+        assert_eq!(
+            app_error.details.get("client"),
+            Some(&serde_json::json!("human_cli"))
+        );
+        assert_eq!(
+            app_error.details.get("field"),
+            Some(&serde_json::json!("clients.*.allowed_request_types"))
+        );
+    }
+
+    #[test]
+    fn authorize_ignores_requested_by_type_for_capability_decisions() {
+        let path = write_policy_file(
+            r#"
+version = 1
+
+[clients.local_cli]
 unix_user = "dev"
-allowed_request_types = ["agent"]
-allowed_capabilities = ["read_basic"]
+allowed_capabilities = ["service_control"]
 
 [actions]
 allowed = ["service.restart"]
@@ -617,11 +651,59 @@ allowed_units = ["nginx.service"]
         engine
             .authorize(&human_request, &metadata, &peer)
             .expect("human request should be allowed");
-
-        let error = engine
+        engine
             .authorize(&agent_request, &metadata, &peer)
-            .expect_err("agent should not get service_control");
-        assert_eq!(error.code, ErrorCode::CapabilityDenied);
+            .expect("agent request should be evaluated from the same peer identity");
+    }
+
+    #[test]
+    fn authorize_ignores_requested_by_id_for_capability_decisions() {
+        let path = write_policy_file(
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "dev"
+allowed_capabilities = ["read_basic"]
+
+[actions]
+allowed = ["system.status"]
+"#,
+        );
+
+        let engine = PolicyEngine::load_from_path(path.clone()).expect("load policy");
+        remove_policy_file(&path);
+
+        let metadata = actions::metadata("system.status").expect("metadata");
+        let peer = PeerCredentials {
+            uid: 1000,
+            gid: 1000,
+            pid: 1,
+            supplementary_gids: Vec::new(),
+            unix_user: Some("dev".to_string()),
+        };
+
+        let mut request = Request {
+            version: 1,
+            request_id: "5348f356-6c80-4c27-b93a-e4436a725663".to_string(),
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Human,
+                id: "cli-a".to_string(),
+            },
+            action: "system.status".to_string(),
+            params: serde_json::Map::new(),
+            dry_run: false,
+            timeout_ms: 3000,
+        };
+
+        engine
+            .authorize(&request, &metadata, &peer)
+            .expect("first request should be allowed");
+
+        request.requested_by.id = "cli-b".to_string();
+        engine
+            .authorize(&request, &metadata, &peer)
+            .expect("second request should be allowed with the same peer identity");
     }
 
     #[test]

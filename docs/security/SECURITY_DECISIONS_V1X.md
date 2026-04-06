@@ -40,9 +40,10 @@ Dieses Dokument haelt die sicherheitsrelevanten Entscheidungen fuer die Nachhaer
 
 - Prioritaet: `P0`
 - GitHub-Issue: `#75`
-- Entscheidung: selbstdeklarierte Request-Metadaten duerfen keine eigenstaendige Security-Semantik tragen, wenn sie nicht an echte Peer-Credentials gebunden sind.
+- Entscheidung: selbstdeklarierte Request-Metadaten duerfen keine eigenstaendige Security-Semantik tragen, wenn sie nicht an echte Peer-Credentials gebunden sind. `requested_by.type` und `requested_by.id` bleiben Audit- und Korrelation-Metadaten; Capability-Entscheidungen folgen nur dem Peer-Match ueber `unix_user` und `unix_group`.
 - Begruendung: Identitaets- und Capability-Entscheidungen muessen auf belastbaren lokalen Identitaetsdaten beruhen.
 - Nicht Ziel: externe Authentifizierungsinfrastruktur oder Netzwerk-Identity-Layer.
+- Zusatzregel: `allowed_request_types` wird in v1.x nicht mehr fuer Autorisierung akzeptiert; getrennte Human-/Agent-Rollen muessen ueber getrennte Unix-Identitaeten oder Gruppen modelliert werden.
 
 ## Entscheidung 6: Policy-Dateirechte werden beim Start validiert
 

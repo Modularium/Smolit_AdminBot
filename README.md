@@ -32,6 +32,12 @@ sudo install -m 0644 config/policy.example.toml /etc/adminbot/policy.toml
 
 Die Beispielpolicy ist bewusst konservativ und gibt dem lokalen Beispielclient nur Read-only-Capabilities.
 
+Wichtig fuer `v1.x`:
+
+- Autorisierung folgt echten lokalen Peer-Credentials (`SO_PEERCRED`, Unix-User, Unix-Gruppen)
+- `requested_by.type` und `requested_by.id` dienen nur Audit, Korrelation und UX
+- wenn Human- und Agent-Rollen unterschiedlich berechtigt sein sollen, muessen sie ueber getrennte Unix-User oder Gruppen getrennt werden
+
 ## Daemon starten
 
 Der Daemon erwartet standardmäßig:
