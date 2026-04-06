@@ -2,6 +2,18 @@
 
 Minimaler Rust-Startpunkt für `AdminBot v2` als lokaler, deterministischer Linux-Daemon.
 
+## Repository Scope
+
+Dieses Repository bildet jetzt nur noch das aktuelle AdminBot-v2-Zielbild ab:
+
+- Rust-Daemon `adminbotd`
+- Operator-CLI `adminbotctl`
+- versionierte Policy-/polkit-/systemd-Artefakte
+- `docs/adminbot_v2/*` als Architektur- und Protokollreferenz
+- `docs/security/*` als kanonische Sicherheitsdokumentation
+
+Der frühere Python-/`rootbot`-/Watchdog-/Docker-/ELK-Bestand ist bewusst nicht mehr Teil dieses Repositories.
+
 Aktueller Stand:
 
 - Unix Domain Socket IPC mit `u32`-Length-Prefix und JSON
@@ -43,6 +55,12 @@ Unterstuetzte Befehle:
 Die vollstaendige Spezifikation und sichere Nutzung liegt unter:
 
 - `docs/cli/adminbotctl.md`
+
+Low-Level-IPC-Testhilfen fuer das v2-Protokoll liegen weiterhin unter:
+
+- `scripts/send_request.sh`
+- `scripts/test_success_case.sh`
+- `scripts/test_policy_deny_case.sh`
 
 ## Policy vorbereiten
 
