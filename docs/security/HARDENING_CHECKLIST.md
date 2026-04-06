@@ -86,7 +86,7 @@
 [x] Policy- und Capability-Entscheidungen werden geloggt
 [x] stderr-Fallback fuer Audit existiert
 [x] repetitive Boundary-Fehler (`validation_error`, `unsupported_version`, `unauthorized`, `forbidden`) werden pro Peer/Action mit Burst-Limit `4 / 1000 ms` auditseitig gedrosselt; ein Suppressionsmarker wird einmalig emittiert
-[ ] Aufbewahrung und Integritaet der Audit-Daten betrieblich definieren
+[x] Aufbewahrung, Integritaet und Incident-Export der Audit-Daten sind betrieblich in `docs/security/AUDIT_OPERATIONS.md` definiert
 [x] Audit-Flooding fuer repetitive invalide Requests ist mit deterministischem Drosselungsfenster bewertet und technisch begrenzt
 [ ] sensible Inhalte in Audit und `journal.query` auf Redaktionsbedarf pruefen
 

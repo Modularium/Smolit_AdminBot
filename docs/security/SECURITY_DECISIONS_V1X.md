@@ -129,7 +129,7 @@ Dieses Dokument haelt die sicherheitsrelevanten Entscheidungen fuer die Nachhaer
 
 - Prioritaet: `P2`
 - GitHub-Issue: `#86`
-- Entscheidung: Audit-Sichtbarkeit, Aufbewahrung und Expositionsgrenzen werden als Betriebsprozess dokumentiert.
+- Entscheidung: Audit-Sichtbarkeit, Aufbewahrung, Incident-Export und Journald-Exposure werden in `docs/security/AUDIT_OPERATIONS.md` als verbindlicher Betriebsprozess dokumentiert. Mindeststandard ist persistentes journald mit lokaler Aufbewahrung von mindestens `30 Tagen` sowie reproduzierbarer Export mit separater SHA-256-Pruefsumme.
 - Begruendung: Incident Response braucht reproduzierbare und sichere Audit-Betriebsregeln.
 - Nicht Ziel: Aufbau eines separaten SIEM-Produkts im selben Schritt.
 
