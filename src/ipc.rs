@@ -515,6 +515,16 @@ impl AdmissionControl {
 fn write_frame_to_writer<T: Serialize, W: Write>(writer: &mut W, value: &T) -> io::Result<()> {
     let payload = serde_json::to_vec(value)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if payload.len() > MAX_IPC_FRAME_SIZE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "IPC frame size {} exceeds maximum size {}",
+                payload.len(),
+                MAX_IPC_FRAME_SIZE
+            ),
+        ));
+    }
     let length = payload.len() as u32;
     writer.write_all(&length.to_be_bytes())?;
     writer.write_all(&payload)?;
@@ -901,7 +911,7 @@ mod tests {
         let response = Response::success(
             "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62581",
             serde_json::json!({
-                "payload": "x".repeat(MAX_IPC_FRAME_SIZE * 32)
+                "payload": "x".repeat(MAX_IPC_FRAME_SIZE.saturating_sub(512))
             }),
         );
 
@@ -912,6 +922,23 @@ mod tests {
         assert!(is_timeout_error(&error));
         assert!(elapsed >= IPC_WRITE_TIMEOUT);
         assert!(elapsed < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn write_frame_rejects_oversized_serialized_response() {
+        let response = Response::success(
+            "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62582",
+            serde_json::json!({
+                "payload": "x".repeat(MAX_IPC_FRAME_SIZE * 2)
+            }),
+        );
+        let mut encoded = Vec::new();
+
+        let error = write_frame_to_writer(&mut encoded, &response).expect_err("oversized response");
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds maximum size"));
+        assert!(encoded.is_empty());
     }
 
     #[test]

@@ -141,6 +141,22 @@ Dieses Dokument haelt die sicherheitsrelevanten Entscheidungen fuer die Nachhaer
 - Begruendung: Informationen ueber Journald, Services, Dateisystem und Systemzustand koennen fuer Spaehung oder Planung missbraucht werden.
 - Nicht Ziel: sofortige funktionale Beschneidung aller Read-only Actions.
 
+## Entscheidung 18: Policy-Sanity-Warnungen bleiben deterministisch und optional fail-closed
+
+- Prioritaet: `P3`
+- GitHub-Issue: Phase 3 Misconfiguration Guards
+- Entscheidung: AdminBot markiert unsichere, aber syntaktisch valide Konfigurationen deterministisch als Sanity-Warnungen. Dazu gehoeren aktuell breite Legacy-Capabilities (`read_sensitive`, `service_control`), fehlende explizite `journal.allowed_units` bei aktivem `journal.query` sowie uebergrosse Unit-Scopes. Ueber `constraints.fail_on_sanity_warnings = true` kann derselbe Befund beim Daemon-Start fail closed erzwungen werden.
+- Begruendung: Sicherheitsdrift entsteht in der Praxis haeufig durch zu breite Konfiguration, nicht nur durch formale Syntaxfehler.
+- Nicht Ziel: heuristische Policy-Linting-Engine oder versteckte Defaults.
+
+## Entscheidung 19: IPC-Response-Groessen werden symmetrisch begrenzt
+
+- Prioritaet: `P3`
+- GitHub-Issue: Phase 3 Misconfiguration Guards
+- Entscheidung: ausgehende IPC-Frames unterliegen derselben harten `64 KiB`-Obergrenze wie eingehende Frames. Serialisierte Responses, die diese Grenze ueberschreiten, werden deterministisch vor dem Write-Pfad verworfen.
+- Begruendung: Defense in Depth endet nicht an der Eingangsgrenze; auch Antwortpfade duerfen weder Memory noch Socket-Rueckstau unbounded bedienen.
+- Nicht Ziel: neues Streaming- oder Chunking-Protokoll.
+
 ## Produktionsfreigabe-Leitlinie
 
 AdminBot gilt erst dann als "hoch sicher fuer produktiven Einsatz", wenn mindestens folgende Entscheidungen umgesetzt und betrieblich verifiziert sind:

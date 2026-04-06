@@ -125,6 +125,7 @@ struct ConstraintsPolicy {
     mutate_requests_per_peer_per_window: Option<u32>,
     global_mutate_requests_per_window: Option<u32>,
     replay_window_ms: Option<u64>,
+    fail_on_sanity_warnings: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +144,7 @@ pub struct Constraints {
     pub mutate_requests_per_peer_per_window: u32,
     pub global_mutate_requests_per_window: u32,
     pub replay_window_ms: u64,
+    pub fail_on_sanity_warnings: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -166,7 +168,27 @@ impl Default for Constraints {
             mutate_requests_per_peer_per_window: 4,
             global_mutate_requests_per_window: 12,
             replay_window_ms: 300_000,
+            fail_on_sanity_warnings: false,
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct PolicySanityWarning {
+    pub code: String,
+    pub policy_section: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PolicyInspection {
+    pub warnings: Vec<PolicySanityWarning>,
+    pub fail_on_sanity_warnings: bool,
+}
+
+impl PolicyInspection {
+    pub fn would_fail_closed(&self) -> bool {
+        self.fail_on_sanity_warnings && !self.warnings.is_empty()
     }
 }
 
@@ -230,6 +252,17 @@ impl PolicyEngine {
         validate_policy_file_for_owner(path, EXPECTED_POLICY_OWNER_UID)
     }
 
+    pub fn inspect_policy_file(
+        path: &std::path::Path,
+    ) -> Result<PolicyInspection, Box<dyn std::error::Error>> {
+        let parsed = parse_policy_file(path)?;
+        let snapshot = snapshot_from_parsed(parsed)?;
+        Ok(PolicyInspection {
+            warnings: collect_policy_sanity_warnings(&snapshot),
+            fail_on_sanity_warnings: snapshot.constraints.fail_on_sanity_warnings,
+        })
+    }
+
     pub fn load_from_path(path: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
         Self::load_from_paths(path.clone(), default_restart_state_path_for_policy(&path))
     }
@@ -238,114 +271,14 @@ impl PolicyEngine {
         path: PathBuf,
         restart_state_path: PathBuf,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let content = fs::read_to_string(path)?;
-        let parsed: PolicyFile = toml::from_str(&content)?;
-        if parsed.version != 1 {
-            return Err(Box::new(AppError::new(
-                ErrorCode::UnsupportedVersion,
-                "policy version must be 1",
-            )));
-        }
-
-        let mut clients = Vec::new();
-        for (client_name, client) in parsed.clients {
-            if !client.allowed_request_types.is_empty() {
-                return Err(Box::new(
-                    AppError::new(
-                        ErrorCode::ValidationError,
-                        "allowed_request_types is not trusted for authorization; use separate unix_user or unix_group bindings",
-                    )
-                    .with_detail("client", client_name)
-                    .with_detail("field", "clients.*.allowed_request_types"),
-                ));
-            }
-
-            let group_gid = match client.unix_group.as_deref() {
-                Some(group_name) => gid_from_group_name(group_name)?,
-                None => None,
-            };
-            clients.push(ClientEntry {
-                unix_user: client.unix_user,
-                unix_group: client.unix_group,
-                group_gid,
-                allowed_capabilities: client.allowed_capabilities.into_iter().collect(),
-            });
-        }
-
-        let security_profile = parsed
-            .constraints
-            .security_profile
-            .unwrap_or(SecurityProfile::Standard);
-        let constraints = Constraints {
-            security_profile,
-            default_timeout_ms: parsed.constraints.default_timeout_ms.unwrap_or(3000),
-            max_timeout_ms: parsed.constraints.max_timeout_ms.unwrap_or(30_000),
-            journal_limit_max: parsed.constraints.journal_limit_max.unwrap_or(200),
-            process_limit_max: parsed.constraints.process_limit_max.unwrap_or(50),
-            max_parallel_mutations: parsed.constraints.max_parallel_mutations.unwrap_or(1),
-            read_rate_limit_window_ms: parsed
-                .constraints
-                .read_rate_limit_window_ms
-                .unwrap_or(1_000),
-            read_requests_per_peer_per_window: parsed
-                .constraints
-                .read_requests_per_peer_per_window
-                .unwrap_or(match security_profile {
-                    SecurityProfile::Standard => 30,
-                    SecurityProfile::HighSecurity => 10,
-                }),
-            global_read_requests_per_window: parsed
-                .constraints
-                .global_read_requests_per_window
-                .unwrap_or(match security_profile {
-                    SecurityProfile::Standard => 120,
-                    SecurityProfile::HighSecurity => 40,
-                }),
-            mutate_rate_limit_window_ms: parsed
-                .constraints
-                .mutate_rate_limit_window_ms
-                .unwrap_or(60_000),
-            mutate_requests_per_peer_per_window: parsed
-                .constraints
-                .mutate_requests_per_peer_per_window
-                .unwrap_or(match security_profile {
-                    SecurityProfile::Standard => 4,
-                    SecurityProfile::HighSecurity => 2,
-                }),
-            global_mutate_requests_per_window: parsed
-                .constraints
-                .global_mutate_requests_per_window
-                .unwrap_or(match security_profile {
-                    SecurityProfile::Standard => 12,
-                    SecurityProfile::HighSecurity => 4,
-                }),
-            replay_window_ms: parsed.constraints.replay_window_ms.unwrap_or(match security_profile {
-                SecurityProfile::Standard => 300_000,
-                SecurityProfile::HighSecurity => 60_000,
-            }),
-        };
+        let parsed = parse_policy_file(&path)?;
+        let snapshot = snapshot_from_parsed(parsed)?;
         let restart_state_store =
             RestartStateStore::new(restart_state_path, current_effective_uid());
         let tracker = restart_state_store.load_or_initialize()?;
 
         Ok(Self {
-            snapshot: PolicySnapshot {
-                actions_allowed: parsed.actions.allowed.into_iter().collect(),
-                actions_denied: parsed.actions.denied.into_iter().collect(),
-                filesystem_allowed_mounts: parsed.filesystem.allowed_mounts.into_iter().collect(),
-                service_allowed_units: parsed.service_control.allowed_units.into_iter().collect(),
-                journal_allowed_units: parsed.journal.allowed_units.into_iter().collect(),
-                restart_cooldown_seconds: parsed
-                    .service_control
-                    .restart_cooldown_seconds
-                    .unwrap_or(300),
-                max_restarts_per_hour: parsed.service_control.max_restarts_per_hour.unwrap_or(3),
-                constraints,
-                observability: ObservabilityConfig {
-                    hash_requested_by_id: parsed.observability.hash_requested_by_id,
-                },
-                clients,
-            },
+            snapshot,
             cooldowns: Mutex::new(RestartGuardState {
                 tracker,
                 persistence_error: None,
@@ -360,6 +293,31 @@ impl PolicyEngine {
 
     pub fn observability(&self) -> &ObservabilityConfig {
         &self.snapshot.observability
+    }
+
+    pub fn sanity_warnings(&self) -> Vec<PolicySanityWarning> {
+        collect_policy_sanity_warnings(&self.snapshot)
+    }
+
+    pub fn enforce_sanity_guards(&self) -> AppResult<()> {
+        let inspection = PolicyInspection {
+            warnings: self.sanity_warnings(),
+            fail_on_sanity_warnings: self.snapshot.constraints.fail_on_sanity_warnings,
+        };
+        if inspection.would_fail_closed() {
+            let mut error = AppError::new(
+                ErrorCode::PreconditionFailed,
+                "policy sanity warnings are configured to fail closed",
+            )
+            .with_detail("warning_count", inspection.warnings.len() as u64);
+            if let Some(first) = inspection.warnings.first() {
+                error = error
+                    .with_detail("first_warning_code", first.code.clone())
+                    .with_detail("first_warning_section", first.policy_section.clone());
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn authorize(
@@ -458,9 +416,15 @@ impl PolicyEngine {
 
     pub fn check_journal_unit_allowed(&self, unit: &str) -> AppResult<()> {
         let (allowed_units, policy_section) = if self.snapshot.journal_allowed_units.is_empty() {
-            (&self.snapshot.service_allowed_units, "service_control.allowed_units")
+            (
+                &self.snapshot.service_allowed_units,
+                "service_control.allowed_units",
+            )
         } else {
-            (&self.snapshot.journal_allowed_units, "journal.allowed_units")
+            (
+                &self.snapshot.journal_allowed_units,
+                "journal.allowed_units",
+            )
         };
 
         if !allowed_units.contains(unit) {
@@ -885,6 +849,184 @@ fn validate_policy_file_for_owner(path: &std::path::Path, expected_uid: u32) -> 
     Ok(())
 }
 
+fn parse_policy_file(path: &std::path::Path) -> Result<PolicyFile, Box<dyn std::error::Error>> {
+    let content = fs::read_to_string(path)?;
+    let parsed: PolicyFile = toml::from_str(&content)?;
+    if parsed.version != 1 {
+        return Err(Box::new(AppError::new(
+            ErrorCode::UnsupportedVersion,
+            "policy version must be 1",
+        )));
+    }
+    Ok(parsed)
+}
+
+fn snapshot_from_parsed(parsed: PolicyFile) -> Result<PolicySnapshot, Box<dyn std::error::Error>> {
+    let mut clients = Vec::new();
+    for (client_name, client) in parsed.clients {
+        if !client.allowed_request_types.is_empty() {
+            return Err(Box::new(
+                AppError::new(
+                    ErrorCode::ValidationError,
+                    "allowed_request_types is not trusted for authorization; use separate unix_user or unix_group bindings",
+                )
+                .with_detail("client", client_name)
+                .with_detail("field", "clients.*.allowed_request_types"),
+            ));
+        }
+
+        let group_gid = match client.unix_group.as_deref() {
+            Some(group_name) => gid_from_group_name(group_name)?,
+            None => None,
+        };
+        clients.push(ClientEntry {
+            unix_user: client.unix_user,
+            unix_group: client.unix_group,
+            group_gid,
+            allowed_capabilities: client.allowed_capabilities.into_iter().collect(),
+        });
+    }
+
+    let security_profile = parsed
+        .constraints
+        .security_profile
+        .unwrap_or(SecurityProfile::Standard);
+    let constraints = Constraints {
+        security_profile,
+        default_timeout_ms: parsed.constraints.default_timeout_ms.unwrap_or(3000),
+        max_timeout_ms: parsed.constraints.max_timeout_ms.unwrap_or(30_000),
+        journal_limit_max: parsed.constraints.journal_limit_max.unwrap_or(200),
+        process_limit_max: parsed.constraints.process_limit_max.unwrap_or(50),
+        max_parallel_mutations: parsed.constraints.max_parallel_mutations.unwrap_or(1),
+        read_rate_limit_window_ms: parsed
+            .constraints
+            .read_rate_limit_window_ms
+            .unwrap_or(1_000),
+        read_requests_per_peer_per_window: parsed
+            .constraints
+            .read_requests_per_peer_per_window
+            .unwrap_or(match security_profile {
+                SecurityProfile::Standard => 30,
+                SecurityProfile::HighSecurity => 10,
+            }),
+        global_read_requests_per_window: parsed
+            .constraints
+            .global_read_requests_per_window
+            .unwrap_or(match security_profile {
+                SecurityProfile::Standard => 120,
+                SecurityProfile::HighSecurity => 40,
+            }),
+        mutate_rate_limit_window_ms: parsed
+            .constraints
+            .mutate_rate_limit_window_ms
+            .unwrap_or(60_000),
+        mutate_requests_per_peer_per_window: parsed
+            .constraints
+            .mutate_requests_per_peer_per_window
+            .unwrap_or(match security_profile {
+                SecurityProfile::Standard => 4,
+                SecurityProfile::HighSecurity => 2,
+            }),
+        global_mutate_requests_per_window: parsed
+            .constraints
+            .global_mutate_requests_per_window
+            .unwrap_or(match security_profile {
+                SecurityProfile::Standard => 12,
+                SecurityProfile::HighSecurity => 4,
+            }),
+        replay_window_ms: parsed
+            .constraints
+            .replay_window_ms
+            .unwrap_or(match security_profile {
+                SecurityProfile::Standard => 300_000,
+                SecurityProfile::HighSecurity => 60_000,
+            }),
+        fail_on_sanity_warnings: parsed.constraints.fail_on_sanity_warnings.unwrap_or(false),
+    };
+
+    Ok(PolicySnapshot {
+        actions_allowed: parsed.actions.allowed.into_iter().collect(),
+        actions_denied: parsed.actions.denied.into_iter().collect(),
+        filesystem_allowed_mounts: parsed.filesystem.allowed_mounts.into_iter().collect(),
+        service_allowed_units: parsed.service_control.allowed_units.into_iter().collect(),
+        journal_allowed_units: parsed.journal.allowed_units.into_iter().collect(),
+        restart_cooldown_seconds: parsed
+            .service_control
+            .restart_cooldown_seconds
+            .unwrap_or(300),
+        max_restarts_per_hour: parsed.service_control.max_restarts_per_hour.unwrap_or(3),
+        constraints,
+        observability: ObservabilityConfig {
+            hash_requested_by_id: parsed.observability.hash_requested_by_id,
+        },
+        clients,
+    })
+}
+
+fn collect_policy_sanity_warnings(snapshot: &PolicySnapshot) -> Vec<PolicySanityWarning> {
+    const BROAD_SCOPE_THRESHOLD: usize = 5;
+
+    let mut warnings = Vec::new();
+
+    if snapshot.clients.iter().any(|client| {
+        client
+            .allowed_capabilities
+            .contains(&Capability::ReadSensitive)
+    }) {
+        warnings.push(PolicySanityWarning {
+            code: "legacy_read_sensitive_capability".to_string(),
+            policy_section: "clients.*.allowed_capabilities".to_string(),
+            message: "read_sensitive remains a broad legacy capability; prefer journal_read and process_read for narrower grants".to_string(),
+        });
+    }
+
+    if snapshot.clients.iter().any(|client| {
+        client
+            .allowed_capabilities
+            .contains(&Capability::ServiceControl)
+    }) {
+        warnings.push(PolicySanityWarning {
+            code: "legacy_service_control_capability".to_string(),
+            policy_section: "clients.*.allowed_capabilities".to_string(),
+            message: "service_control remains a broader legacy capability; prefer service_restart when only restart is intended".to_string(),
+        });
+    }
+
+    if snapshot.actions_allowed.contains("journal.query")
+        && snapshot.journal_allowed_units.is_empty()
+    {
+        warnings.push(PolicySanityWarning {
+            code: "journal_scope_falls_back_to_service_units".to_string(),
+            policy_section: "journal.allowed_units".to_string(),
+            message: "journal.query is enabled without an explicit journal.allowed_units scope and will fall back to the broader service_control.allowed_units set".to_string(),
+        });
+    }
+
+    if snapshot.service_allowed_units.len() > BROAD_SCOPE_THRESHOLD {
+        warnings.push(PolicySanityWarning {
+            code: "service_scope_is_broad".to_string(),
+            policy_section: "service_control.allowed_units".to_string(),
+            message: format!(
+                "service_control.allowed_units contains {} entries; review whether service scope can be narrowed",
+                snapshot.service_allowed_units.len()
+            ),
+        });
+    }
+
+    if snapshot.journal_allowed_units.len() > BROAD_SCOPE_THRESHOLD {
+        warnings.push(PolicySanityWarning {
+            code: "journal_scope_is_broad".to_string(),
+            policy_section: "journal.allowed_units".to_string(),
+            message: format!(
+                "journal.allowed_units contains {} entries; review whether journal scope can be narrowed",
+                snapshot.journal_allowed_units.len()
+            ),
+        });
+    }
+
+    warnings
+}
+
 impl std::fmt::Display for Capability {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let value = match self {
@@ -1030,17 +1172,32 @@ max_parallel_mutations = 1
         );
         assert_eq!(engine.snapshot.constraints.read_rate_limit_window_ms, 1_000);
         assert_eq!(
-            engine.snapshot.constraints.read_requests_per_peer_per_window,
+            engine
+                .snapshot
+                .constraints
+                .read_requests_per_peer_per_window,
             30
         );
-        assert_eq!(engine.snapshot.constraints.global_read_requests_per_window, 120);
-        assert_eq!(engine.snapshot.constraints.mutate_rate_limit_window_ms, 60_000);
         assert_eq!(
-            engine.snapshot.constraints.mutate_requests_per_peer_per_window,
+            engine.snapshot.constraints.global_read_requests_per_window,
+            120
+        );
+        assert_eq!(
+            engine.snapshot.constraints.mutate_rate_limit_window_ms,
+            60_000
+        );
+        assert_eq!(
+            engine
+                .snapshot
+                .constraints
+                .mutate_requests_per_peer_per_window,
             4
         );
         assert_eq!(
-            engine.snapshot.constraints.global_mutate_requests_per_window,
+            engine
+                .snapshot
+                .constraints
+                .global_mutate_requests_per_window,
             12
         );
         assert_eq!(engine.snapshot.constraints.replay_window_ms, 300_000);
@@ -1156,6 +1313,79 @@ allowed = ["system.status"]
 
         validate_policy_file_for_owner(&path, current_uid()).expect("trusted file must pass");
         remove_policy_file(&path);
+    }
+
+    #[test]
+    fn inspect_policy_reports_broad_legacy_capabilities_and_journal_fallback() {
+        let path = write_policy_file(
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "dev"
+allowed_capabilities = ["read_sensitive", "service_control"]
+
+[actions]
+allowed = ["system.status", "journal.query", "service.restart"]
+denied = []
+
+[service_control]
+allowed_units = ["nginx.service"]
+"#,
+        );
+
+        let inspection = PolicyEngine::inspect_policy_file(&path).expect("inspect policy");
+        remove_policy_file(&path);
+
+        assert!(!inspection.would_fail_closed());
+        assert!(inspection
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "legacy_read_sensitive_capability"));
+        assert!(inspection
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "legacy_service_control_capability"));
+        assert!(inspection
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "journal_scope_falls_back_to_service_units"));
+    }
+
+    #[test]
+    fn sanity_guard_fails_closed_when_policy_requests_it() {
+        let path = write_policy_file(
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "dev"
+allowed_capabilities = ["read_sensitive"]
+
+[actions]
+allowed = ["system.status"]
+denied = []
+
+[constraints]
+fail_on_sanity_warnings = true
+"#,
+        );
+
+        let engine = PolicyEngine::load_from_path(path.clone()).expect("load policy");
+        let error = engine
+            .enforce_sanity_guards()
+            .expect_err("sanity guard should fail closed");
+        remove_policy_file(&path);
+
+        assert_eq!(error.code, ErrorCode::PreconditionFailed);
+        assert_eq!(
+            error.message,
+            "policy sanity warnings are configured to fail closed"
+        );
+        assert_eq!(
+            error.details.get("first_warning_code"),
+            Some(&serde_json::json!("legacy_read_sensitive_capability"))
+        );
     }
 
     #[test]
@@ -1496,10 +1726,31 @@ security_profile = "high_security"
             engine.snapshot.constraints.security_profile,
             SecurityProfile::HighSecurity
         );
-        assert_eq!(engine.snapshot.constraints.read_requests_per_peer_per_window, 10);
-        assert_eq!(engine.snapshot.constraints.global_read_requests_per_window, 40);
-        assert_eq!(engine.snapshot.constraints.mutate_requests_per_peer_per_window, 2);
-        assert_eq!(engine.snapshot.constraints.global_mutate_requests_per_window, 4);
+        assert_eq!(
+            engine
+                .snapshot
+                .constraints
+                .read_requests_per_peer_per_window,
+            10
+        );
+        assert_eq!(
+            engine.snapshot.constraints.global_read_requests_per_window,
+            40
+        );
+        assert_eq!(
+            engine
+                .snapshot
+                .constraints
+                .mutate_requests_per_peer_per_window,
+            2
+        );
+        assert_eq!(
+            engine
+                .snapshot
+                .constraints
+                .global_mutate_requests_per_window,
+            4
+        );
         assert_eq!(engine.snapshot.constraints.replay_window_ms, 60_000);
     }
 
