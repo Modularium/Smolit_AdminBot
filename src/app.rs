@@ -495,6 +495,109 @@ denied = []
         }
     }
 
+    #[test]
+    fn disk_usage_returns_structured_fields_for_allowed_mount() {
+        let app = App::new(policy_for_current_user(
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "__USER__"
+allowed_capabilities = ["read_basic"]
+
+[actions]
+allowed = ["disk.usage"]
+denied = []
+
+[filesystem]
+allowed_mounts = ["/"]
+"#,
+        ));
+
+        let request = Request {
+            version: 1,
+            request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62580".to_string(),
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Human,
+                id: "test-cli".to_string(),
+            },
+            action: "disk.usage".to_string(),
+            params: serde_json::from_value(json!({
+                "mounts": ["/"]
+            }))
+            .expect("params"),
+            dry_run: false,
+            timeout_ms: 3000,
+        };
+
+        let response = app.handle_request(request, current_peer());
+        match response {
+            Response::Success(success) => {
+                let mounts = success.result["mounts"].as_array().expect("mounts array");
+                assert_eq!(mounts.len(), 1);
+                assert_eq!(mounts[0]["path"], "/");
+                assert!(mounts[0]["total_bytes"].is_u64());
+                assert!(mounts[0]["used_bytes"].is_u64());
+                assert!(mounts[0]["available_bytes"].is_u64());
+                assert!(mounts[0]["percent_used"].is_number());
+            }
+            Response::Error(error) => panic!("unexpected error response: {:?}", error),
+        }
+    }
+
+    #[test]
+    fn disk_usage_rejects_mounts_outside_policy_whitelist() {
+        let app = App::new(policy_for_current_user(
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "__USER__"
+allowed_capabilities = ["read_basic"]
+
+[actions]
+allowed = ["disk.usage"]
+denied = []
+
+[filesystem]
+allowed_mounts = ["/"]
+"#,
+        ));
+
+        let request = Request {
+            version: 1,
+            request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62581".to_string(),
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Human,
+                id: "test-cli".to_string(),
+            },
+            action: "disk.usage".to_string(),
+            params: serde_json::from_value(json!({
+                "mounts": ["/var"]
+            }))
+            .expect("params"),
+            dry_run: false,
+            timeout_ms: 3000,
+        };
+
+        let response = app.handle_request(request, current_peer());
+        match response {
+            Response::Error(error) => {
+                assert_eq!(
+                    serde_json::to_value(error.error.code).unwrap(),
+                    json!("policy_denied")
+                );
+                assert_eq!(error.error.details["field"], "params.mounts");
+                assert_eq!(error.error.details["mount"], "/var");
+                assert_eq!(
+                    error.error.details["policy_section"],
+                    "filesystem.allowed_mounts"
+                );
+            }
+            Response::Success(success) => panic!("unexpected success response: {:?}", success),
+        }
+    }
+
     fn current_peer() -> PeerCredentials {
         PeerCredentials {
             uid: unsafe { libc::geteuid() },

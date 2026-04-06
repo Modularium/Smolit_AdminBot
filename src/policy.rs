@@ -28,6 +28,8 @@ struct PolicyFile {
     clients: HashMap<String, ClientRule>,
     actions: ActionPolicy,
     #[serde(default)]
+    filesystem: FilesystemPolicy,
+    #[serde(default)]
     service_control: ServiceControlPolicy,
     #[serde(default)]
     constraints: ConstraintsPolicy,
@@ -51,6 +53,13 @@ struct ActionPolicy {
     allowed: Vec<String>,
     #[serde(default)]
     denied: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FilesystemPolicy {
+    #[serde(default)]
+    allowed_mounts: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -98,6 +107,7 @@ impl Default for Constraints {
 pub struct PolicySnapshot {
     actions_allowed: HashSet<String>,
     actions_denied: HashSet<String>,
+    filesystem_allowed_mounts: HashSet<String>,
     service_allowed_units: HashSet<String>,
     restart_cooldown_seconds: u64,
     max_restarts_per_hour: u32,
@@ -164,6 +174,7 @@ impl PolicyEngine {
             snapshot: PolicySnapshot {
                 actions_allowed: parsed.actions.allowed.into_iter().collect(),
                 actions_denied: parsed.actions.denied.into_iter().collect(),
+                filesystem_allowed_mounts: parsed.filesystem.allowed_mounts.into_iter().collect(),
                 service_allowed_units: parsed.service_control.allowed_units.into_iter().collect(),
                 restart_cooldown_seconds: parsed
                     .service_control
@@ -254,6 +265,19 @@ impl PolicyEngine {
             return Err(
                 AppError::new(ErrorCode::RateLimited, "restart rate limit exceeded")
                     .with_detail("unit", unit.to_string()),
+            );
+        }
+
+        Ok(())
+    }
+
+    pub fn check_mount_allowed(&self, mount: &str) -> AppResult<()> {
+        if !self.snapshot.filesystem_allowed_mounts.contains(mount) {
+            return Err(
+                AppError::new(ErrorCode::PolicyDenied, "mount not allowed by policy")
+                    .with_detail("field", "params.mounts")
+                    .with_detail("mount", mount.to_string())
+                    .with_detail("policy_section", "filesystem.allowed_mounts"),
             );
         }
 
@@ -386,6 +410,9 @@ allowed_capabilities = ["service_control"]
 allowed = ["system.status", "service.status", "service.restart"]
 denied = ["journal.query"]
 
+[filesystem]
+allowed_mounts = ["/", "/var"]
+
 [service_control]
 allowed_units = ["sshd.service", "nginx.service"]
 restart_cooldown_seconds = 120
@@ -405,6 +432,8 @@ max_parallel_mutations = 1
 
         assert!(engine.snapshot.actions_allowed.contains("system.status"));
         assert!(engine.snapshot.actions_denied.contains("journal.query"));
+        assert!(engine.snapshot.filesystem_allowed_mounts.contains("/"));
+        assert!(engine.snapshot.filesystem_allowed_mounts.contains("/var"));
         assert!(engine
             .snapshot
             .service_allowed_units
@@ -643,5 +672,43 @@ max_restarts_per_hour = 1
             .check_service_restart_allowed("nginx.service")
             .expect_err("rate limit should be enforced");
         assert_eq!(error.code, ErrorCode::RateLimited);
+    }
+
+    #[test]
+    fn check_mount_allowed_rejects_mounts_outside_filesystem_whitelist() {
+        let path = write_policy_file(
+            r#"
+version = 1
+
+[actions]
+allowed = ["disk.usage"]
+
+[filesystem]
+allowed_mounts = ["/", "/var"]
+"#,
+        );
+
+        let engine = PolicyEngine::load_from_path(path.clone()).expect("load policy");
+        remove_policy_file(&path);
+
+        engine.check_mount_allowed("/").expect("root mount allowed");
+
+        let error = engine
+            .check_mount_allowed("/home")
+            .expect_err("mount should be denied");
+        assert_eq!(error.code, ErrorCode::PolicyDenied);
+        assert_eq!(error.message, "mount not allowed by policy");
+        assert_eq!(
+            error.details.get("field"),
+            Some(&serde_json::json!("params.mounts"))
+        );
+        assert_eq!(
+            error.details.get("mount"),
+            Some(&serde_json::json!("/home"))
+        );
+        assert_eq!(
+            error.details.get("policy_section"),
+            Some(&serde_json::json!("filesystem.allowed_mounts"))
+        );
     }
 }
