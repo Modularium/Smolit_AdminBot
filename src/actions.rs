@@ -326,6 +326,7 @@ fn validate_params(action: &str, params: &Value, app: &App) -> AppResult<()> {
             }
             for mount in parsed.mounts {
                 validate_mount(&mount)?;
+                app.policy().check_mount_allowed(&mount)?;
             }
         }
         "service.status" => {
