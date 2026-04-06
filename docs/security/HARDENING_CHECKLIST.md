@@ -74,7 +74,7 @@
 [x] Unit-Namen werden strikt validiert
 [x] Journal-Queries sind begrenzt nach Count und Zeitfenster
 [x] Journal-Queries clippen einzelne `MESSAGE`-Felder auf `2048 Bytes` und begrenzen die gesamte JSON-Antwort deterministisch auf `32768 Bytes`
-[ ] Sensitivitaet von Read-only Endpoints pro Deployment explizit freigeben
+[x] Read-only Actions sind in `docs/security/READ_ONLY_ACTION_SENSITIVITY.md` klassifiziert; Default-Policy bleibt ohne `read_sensitive`
 [ ] D-Bus- und journald-Ausfallpfade betrieblich absichern
 
 ## Logging und Audit

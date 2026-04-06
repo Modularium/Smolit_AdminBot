@@ -2,7 +2,7 @@ version = 1
 
 [clients.local_cli]
 unix_user = "dev"
-allowed_capabilities = ["read_basic", "read_sensitive", "service_read"]
+allowed_capabilities = ["read_basic", "service_read"]
 
 [actions]
 allowed = [
@@ -12,11 +12,14 @@ allowed = [
   "disk.usage",
   "network.interface_status",
   "service.status",
-  "journal.query",
-  "process.snapshot",
-  "service.restart",
 ]
 denied = []
+
+# Opt-in only after explicit local security review:
+# - add "read_sensitive" only for trusted incident operators
+# - add "journal.query" only when journald exposure is really needed
+# - add "process.snapshot" only when process-level diagnostics are required
+# - add "service.restart" only together with "service_control"
 
 [service_control]
 allowed_units = ["nginx.service"]
