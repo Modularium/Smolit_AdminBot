@@ -154,6 +154,7 @@ fn write_frame_to_writer<W: Write>(writer: &mut W, response: &Response) -> io::R
 mod tests {
     use super::*;
     use crate::app::App;
+    use crate::peer::get_peer_credentials;
     use crate::policy::PolicyEngine;
     use std::io::Cursor;
     use std::os::unix::fs::FileTypeExt;
@@ -196,7 +197,27 @@ mod tests {
         let server = IpcServer::bind_for_test(path.clone()).expect("bind");
         let metadata = fs::metadata(server.socket_path()).expect("metadata");
         assert!(metadata.file_type().is_socket());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o660);
         drop(server);
+    }
+
+    #[test]
+    fn peer_credentials_can_be_read_from_local_connection() {
+        let (server_stream, client_stream) = UnixStream::pair().expect("pair");
+        let server_peer = get_peer_credentials(&server_stream).expect("server peer");
+        let client_peer = get_peer_credentials(&client_stream).expect("client peer");
+
+        let expected_uid = unsafe { libc::geteuid() };
+        let expected_gid = unsafe { libc::getegid() };
+        let expected_pid = unsafe { libc::getpid() as u32 };
+
+        assert_eq!(server_peer.uid, expected_uid);
+        assert_eq!(server_peer.gid, expected_gid);
+        assert_eq!(server_peer.pid, expected_pid);
+        assert_eq!(client_peer.uid, expected_uid);
+        assert_eq!(client_peer.gid, expected_gid);
+        assert_eq!(client_peer.pid, expected_pid);
+        assert!(server_peer.unix_user.is_some());
     }
 
     #[test]
@@ -234,6 +255,51 @@ mod tests {
             serde_json::from_slice(&response_payload).expect("decode response");
         assert_eq!(response["status"], "ok");
         assert!(response["result"]["hostname"].is_string());
+
+        handle.join().expect("join").expect("server run_once");
+        let _ = fs::remove_file(policy_path);
+    }
+
+    #[test]
+    fn run_once_rejects_unmapped_peer_with_unauthorized_error() {
+        let socket_path = temp_socket_path("unauthorized");
+        let policy_path = temp_policy_path_for_user("definitely-not-the-current-user");
+        let policy = PolicyEngine::load_from_path(policy_path.clone()).expect("policy");
+        let app = App::new(policy);
+        let server = IpcServer::bind_for_test(socket_path.clone()).expect("bind");
+
+        let handle = thread::spawn(move || server.run_once(&app));
+
+        let mut client = connect_with_retry(&socket_path);
+        let request = serde_json::json!({
+            "version": 1,
+            "request_id": "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62573",
+            "requested_by": {
+                "type": "human",
+                "id": "ipc-test"
+            },
+            "action": "system.status",
+            "params": {},
+            "dry_run": false,
+            "timeout_ms": 3000
+        });
+        let payload = serde_json::to_vec(&request).expect("encode request");
+        write_raw_frame(&mut client, &payload);
+
+        let response_payload = read_frame(&mut client).expect("read response");
+        let response: serde_json::Value =
+            serde_json::from_slice(&response_payload).expect("decode response");
+        assert_eq!(
+            response["request_id"],
+            "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62573"
+        );
+        assert_eq!(response["status"], "error");
+        assert_eq!(response["error"]["code"], "unauthorized");
+        assert_eq!(
+            response["error"]["message"],
+            "peer is not mapped to any policy client"
+        );
+        assert_eq!(response["error"]["retryable"], false);
 
         handle.join().expect("join").expect("server run_once");
         let _ = fs::remove_file(policy_path);
@@ -281,13 +347,17 @@ mod tests {
     }
 
     fn temp_policy_path() -> PathBuf {
+        let user = env::var("USER").unwrap_or_else(|_| "unknown".to_string());
+        temp_policy_path_for_user(&user)
+    }
+
+    fn temp_policy_path_for_user(user: &str) -> PathBuf {
         let mut path = env::temp_dir();
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time")
             .as_nanos();
         path.push(format!("adminbot-policy-{nanos}.toml"));
-        let user = env::var("USER").unwrap_or_else(|_| "unknown".to_string());
         let policy = format!(
             "version = 1\n\n[clients.local_cli]\nunix_user = \"{user}\"\nallowed_capabilities = [\"read_basic\"]\n\n[actions]\nallowed = [\"system.status\"]\ndenied = []\n"
         );
