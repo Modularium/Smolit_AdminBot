@@ -12,14 +12,22 @@ pub struct AuditLogger;
 
 #[derive(Debug, Clone, Copy)]
 enum AuditDecision {
+    Pending,
     Allow,
     Deny,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AuditStage {
+    Received,
+    Completed,
 }
 
 #[derive(Debug)]
 struct AuditEvent<'a> {
     request: &'a Request,
     peer: &'a PeerCredentials,
+    stage: AuditStage,
     decision: AuditDecision,
     result: &'a str,
     error: Option<&'a AppError>,
@@ -31,12 +39,25 @@ unsafe extern "C" {
 }
 
 impl AuditLogger {
+    pub fn log_received(&self, request: &Request, peer: &PeerCredentials) {
+        let event = AuditEvent {
+            request,
+            peer,
+            stage: AuditStage::Received,
+            decision: AuditDecision::Pending,
+            result: "received",
+            error: None,
+        };
+        self.log_event(&event);
+    }
+
     pub fn log_success(&self, request: &Request, peer: &PeerCredentials) {
         let event = AuditEvent {
             request,
             peer,
+            stage: AuditStage::Completed,
             decision: AuditDecision::Allow,
-            result: "ok",
+            result: success_result(request),
             error: None,
         };
         self.log_event(&event);
@@ -46,6 +67,7 @@ impl AuditLogger {
         let event = AuditEvent {
             request,
             peer,
+            stage: AuditStage::Completed,
             decision: AuditDecision::Deny,
             result: "error",
             error: Some(error),
@@ -69,6 +91,7 @@ fn build_journald_fields(event: &AuditEvent<'_>) -> Vec<CString> {
         cstring_field("ADMINBOT_EVENT_KIND", "audit"),
         cstring_field("ADMINBOT_REQUEST_ID", &event.request.request_id),
         cstring_field("ADMINBOT_ACTION", &event.request.action),
+        cstring_field("ADMINBOT_STAGE", stage_value(event.stage)),
         cstring_field(
             "ADMINBOT_REQUESTED_BY_TYPE",
             requested_by_type(event.request),
@@ -77,6 +100,7 @@ fn build_journald_fields(event: &AuditEvent<'_>) -> Vec<CString> {
         cstring_field("ADMINBOT_PEER_UID", &event.peer.uid.to_string()),
         cstring_field("ADMINBOT_PEER_GID", &event.peer.gid.to_string()),
         cstring_field("ADMINBOT_PEER_PID", &event.peer.pid.to_string()),
+        cstring_field("ADMINBOT_DRY_RUN", bool_value(event.request.dry_run)),
         cstring_field("ADMINBOT_DECISION", decision_value(event.decision)),
         cstring_field("ADMINBOT_RESULT", event.result),
     ];
@@ -112,6 +136,7 @@ fn fallback_json(event: &AuditEvent<'_>) -> serde_json::Value {
     let mut entry = json!({
         "request_id": event.request.request_id,
         "action": event.request.action,
+        "stage": stage_value(event.stage),
         "requested_by": {
             "type": event.request.requested_by.origin_type,
             "id": event.request.requested_by.id
@@ -121,6 +146,7 @@ fn fallback_json(event: &AuditEvent<'_>) -> serde_json::Value {
             "gid": event.peer.gid,
             "pid": event.peer.pid
         },
+        "dry_run": event.request.dry_run,
         "decision": decision_value(event.decision),
         "result": event.result
     });
@@ -149,28 +175,59 @@ fn requested_by_type(request: &Request) -> &'static str {
 
 fn decision_value(decision: AuditDecision) -> &'static str {
     match decision {
+        AuditDecision::Pending => "pending",
         AuditDecision::Allow => "allow",
         AuditDecision::Deny => "deny",
     }
 }
 
+fn stage_value(stage: AuditStage) -> &'static str {
+    match stage {
+        AuditStage::Received => "received",
+        AuditStage::Completed => "completed",
+    }
+}
+
 fn priority_value(event: &AuditEvent<'_>) -> &'static str {
     match event.decision {
+        AuditDecision::Pending => "6",
         AuditDecision::Allow => "6",
         AuditDecision::Deny => "4",
     }
 }
 
 fn format_message(event: &AuditEvent<'_>) -> String {
-    match event.error {
-        Some(error) => format!(
-            "adminbot audit deny action={} request_id={} error_code={}",
-            event.request.action, event.request.request_id, error.code
+    match event.stage {
+        AuditStage::Received => format!(
+            "adminbot audit received action={} request_id={} dry_run={}",
+            event.request.action, event.request.request_id, event.request.dry_run
         ),
-        None => format!(
-            "adminbot audit allow action={} request_id={}",
-            event.request.action, event.request.request_id
-        ),
+        AuditStage::Completed => match event.error {
+            Some(error) => format!(
+                "adminbot audit deny action={} request_id={} error_code={}",
+                event.request.action, event.request.request_id, error.code
+            ),
+            None => format!(
+                "adminbot audit allow action={} request_id={}",
+                event.request.action, event.request.request_id
+            ),
+        },
+    }
+}
+
+fn success_result(request: &Request) -> &'static str {
+    if request.dry_run {
+        "dry_run_ok"
+    } else {
+        "ok"
+    }
+}
+
+fn bool_value(value: bool) -> &'static str {
+    if value {
+        "true"
+    } else {
+        "false"
     }
 }
 
@@ -187,6 +244,7 @@ mod tests {
         let event = AuditEvent {
             request: &request,
             peer: &peer,
+            stage: AuditStage::Completed,
             decision: AuditDecision::Allow,
             result: "ok",
             error: None,
@@ -201,8 +259,33 @@ mod tests {
         assert!(fields.contains(&"SYSLOG_IDENTIFIER=adminbotd".to_string()));
         assert!(fields.contains(&"ADMINBOT_REQUEST_ID=test-request-id".to_string()));
         assert!(fields.contains(&"ADMINBOT_ACTION=system.status".to_string()));
+        assert!(fields.contains(&"ADMINBOT_STAGE=completed".to_string()));
+        assert!(fields.contains(&"ADMINBOT_DRY_RUN=false".to_string()));
         assert!(fields.contains(&"ADMINBOT_DECISION=allow".to_string()));
         assert!(fields.contains(&"ADMINBOT_RESULT=ok".to_string()));
+    }
+
+    #[test]
+    fn build_journald_fields_marks_received_stage_for_incoming_request() {
+        let request = test_request();
+        let peer = test_peer();
+        let event = AuditEvent {
+            request: &request,
+            peer: &peer,
+            stage: AuditStage::Received,
+            decision: AuditDecision::Pending,
+            result: "received",
+            error: None,
+        };
+
+        let fields = build_journald_fields(&event)
+            .into_iter()
+            .map(|field| field.into_string().expect("utf8"))
+            .collect::<Vec<_>>();
+
+        assert!(fields.contains(&"ADMINBOT_STAGE=received".to_string()));
+        assert!(fields.contains(&"ADMINBOT_DECISION=pending".to_string()));
+        assert!(fields.contains(&"ADMINBOT_RESULT=received".to_string()));
     }
 
     #[test]
@@ -213,6 +296,7 @@ mod tests {
         let event = AuditEvent {
             request: &request,
             peer: &peer,
+            stage: AuditStage::Completed,
             decision: AuditDecision::Deny,
             result: "error",
             error: Some(&error),
@@ -230,6 +314,14 @@ mod tests {
     }
 
     #[test]
+    fn success_result_marks_dry_run_requests_explicitly() {
+        let mut request = test_request();
+        request.dry_run = true;
+
+        assert_eq!(success_result(&request), "dry_run_ok");
+    }
+
+    #[test]
     fn fallback_json_preserves_existing_error_shape() {
         let request = test_request();
         let peer = test_peer();
@@ -237,6 +329,7 @@ mod tests {
         let event = AuditEvent {
             request: &request,
             peer: &peer,
+            stage: AuditStage::Completed,
             decision: AuditDecision::Deny,
             result: "error",
             error: Some(&error),
@@ -245,6 +338,8 @@ mod tests {
         let json = fallback_json(&event);
         assert_eq!(json["request_id"], "test-request-id");
         assert_eq!(json["action"], "system.status");
+        assert_eq!(json["stage"], "completed");
+        assert_eq!(json["dry_run"], false);
         assert_eq!(json["decision"], "deny");
         assert_eq!(json["result"], "error");
         assert_eq!(json["error"]["code"], "execution_failed");
