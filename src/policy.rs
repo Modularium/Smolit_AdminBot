@@ -26,8 +26,11 @@ pub const RESTART_STATE_MODE: u32 = 0o600;
 pub enum Capability {
     ReadBasic,
     ReadSensitive,
+    JournalRead,
+    ProcessRead,
     ServiceRead,
     ServiceControl,
+    ServiceRestart,
 }
 
 #[derive(Debug, Deserialize)]
@@ -41,6 +44,8 @@ struct PolicyFile {
     filesystem: FilesystemPolicy,
     #[serde(default)]
     service_control: ServiceControlPolicy,
+    #[serde(default)]
+    journal: JournalPolicy,
     #[serde(default)]
     constraints: ConstraintsPolicy,
 }
@@ -79,6 +84,13 @@ struct ServiceControlPolicy {
     allowed_units: Vec<String>,
     restart_cooldown_seconds: Option<u64>,
     max_restarts_per_hour: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JournalPolicy {
+    #[serde(default)]
+    allowed_units: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -137,6 +149,7 @@ pub struct PolicySnapshot {
     actions_denied: HashSet<String>,
     filesystem_allowed_mounts: HashSet<String>,
     service_allowed_units: HashSet<String>,
+    journal_allowed_units: HashSet<String>,
     restart_cooldown_seconds: u64,
     max_restarts_per_hour: u32,
     constraints: Constraints,
@@ -272,6 +285,7 @@ impl PolicyEngine {
                 actions_denied: parsed.actions.denied.into_iter().collect(),
                 filesystem_allowed_mounts: parsed.filesystem.allowed_mounts.into_iter().collect(),
                 service_allowed_units: parsed.service_control.allowed_units.into_iter().collect(),
+                journal_allowed_units: parsed.journal.allowed_units.into_iter().collect(),
                 restart_cooldown_seconds: parsed
                     .service_control
                     .restart_cooldown_seconds
@@ -313,7 +327,10 @@ impl PolicyEngine {
         }
 
         let capabilities = self.capabilities_for_request_peer(request, peer)?;
-        if !capabilities.contains(&metadata.required_capability) {
+        if !capabilities
+            .iter()
+            .any(|capability| capability_satisfies(*capability, metadata.required_capability))
+        {
             return Err(
                 AppError::new(ErrorCode::CapabilityDenied, "required capability missing")
                     .with_detail("action", request.action.clone())
@@ -377,6 +394,25 @@ impl PolicyEngine {
                     .with_detail("field", "params.unit")
                     .with_detail("unit", unit.to_string())
                     .with_detail("policy_section", "service_control.allowed_units"),
+            );
+        }
+
+        Ok(())
+    }
+
+    pub fn check_journal_unit_allowed(&self, unit: &str) -> AppResult<()> {
+        let (allowed_units, policy_section) = if self.snapshot.journal_allowed_units.is_empty() {
+            (&self.snapshot.service_allowed_units, "service_control.allowed_units")
+        } else {
+            (&self.snapshot.journal_allowed_units, "journal.allowed_units")
+        };
+
+        if !allowed_units.contains(unit) {
+            return Err(
+                AppError::new(ErrorCode::PolicyDenied, "unit not allowed by policy")
+                    .with_detail("field", "params.unit")
+                    .with_detail("unit", unit.to_string())
+                    .with_detail("policy_section", policy_section),
             );
         }
 
@@ -798,11 +834,24 @@ impl std::fmt::Display for Capability {
         let value = match self {
             Capability::ReadBasic => "read_basic",
             Capability::ReadSensitive => "read_sensitive",
+            Capability::JournalRead => "journal_read",
+            Capability::ProcessRead => "process_read",
             Capability::ServiceRead => "service_read",
             Capability::ServiceControl => "service_control",
+            Capability::ServiceRestart => "service_restart",
         };
         f.write_str(value)
     }
+}
+
+fn capability_satisfies(granted: Capability, required: Capability) -> bool {
+    granted == required
+        || matches!(
+            (granted, required),
+            (Capability::ReadSensitive, Capability::JournalRead)
+                | (Capability::ReadSensitive, Capability::ProcessRead)
+                | (Capability::ServiceControl, Capability::ServiceRestart)
+        )
 }
 
 #[cfg(test)]
@@ -1217,6 +1266,151 @@ allowed = ["service.status"]
             .authorize(&request, &metadata, &peer)
             .expect_err("capability denied");
         assert_eq!(error.code, ErrorCode::CapabilityDenied);
+    }
+
+    #[test]
+    fn legacy_read_sensitive_still_authorizes_journal_and_process_reads() {
+        let path = write_policy_file(
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "dev"
+allowed_capabilities = ["read_sensitive"]
+
+[actions]
+allowed = ["journal.query", "process.snapshot"]
+
+[service_control]
+allowed_units = ["nginx.service"]
+"#,
+        );
+
+        let engine = PolicyEngine::load_from_path(path.clone()).expect("load policy");
+        remove_policy_file(&path);
+        let peer = PeerCredentials {
+            uid: 1000,
+            gid: 1000,
+            pid: 1,
+            supplementary_gids: Vec::new(),
+            unix_user: Some("dev".to_string()),
+        };
+
+        let journal_request = Request {
+            version: 1,
+            request_id: "b398e7a0-ae50-4a60-aef1-8e7b38eb84d0".to_string(),
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Human,
+                id: "local-cli".to_string(),
+            },
+            action: "journal.query".to_string(),
+            params: serde_json::Map::new(),
+            dry_run: false,
+            timeout_ms: 3000,
+        };
+        let process_request = Request {
+            action: "process.snapshot".to_string(),
+            request_id: "b398e7a0-ae50-4a60-aef1-8e7b38eb84d1".to_string(),
+            ..journal_request.clone()
+        };
+
+        engine
+            .authorize(
+                &journal_request,
+                &actions::metadata("journal.query").expect("journal metadata"),
+                &peer,
+            )
+            .expect("legacy read_sensitive should still authorize journal.query");
+        engine
+            .authorize(
+                &process_request,
+                &actions::metadata("process.snapshot").expect("process metadata"),
+                &peer,
+            )
+            .expect("legacy read_sensitive should still authorize process.snapshot");
+    }
+
+    #[test]
+    fn legacy_service_control_still_authorizes_service_restart() {
+        let path = write_policy_file(
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "dev"
+allowed_capabilities = ["service_control"]
+
+[actions]
+allowed = ["service.restart"]
+
+[service_control]
+allowed_units = ["nginx.service"]
+"#,
+        );
+
+        let engine = PolicyEngine::load_from_path(path.clone()).expect("load policy");
+        remove_policy_file(&path);
+        let request = Request {
+            version: 1,
+            request_id: "b398e7a0-ae50-4a60-aef1-8e7b38eb84d2".to_string(),
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Human,
+                id: "local-cli".to_string(),
+            },
+            action: "service.restart".to_string(),
+            params: serde_json::Map::new(),
+            dry_run: false,
+            timeout_ms: 3000,
+        };
+        let peer = PeerCredentials {
+            uid: 1000,
+            gid: 1000,
+            pid: 1,
+            supplementary_gids: Vec::new(),
+            unix_user: Some("dev".to_string()),
+        };
+
+        engine
+            .authorize(
+                &request,
+                &actions::metadata("service.restart").expect("restart metadata"),
+                &peer,
+            )
+            .expect("legacy service_control should still authorize service.restart");
+    }
+
+    #[test]
+    fn journal_policy_scope_overrides_service_control_units_when_present() {
+        let path = write_policy_file(
+            r#"
+version = 1
+
+[actions]
+allowed = ["journal.query"]
+
+[service_control]
+allowed_units = ["nginx.service"]
+
+[journal]
+allowed_units = ["adminbotd.service"]
+"#,
+        );
+
+        let engine = PolicyEngine::load_from_path(path.clone()).expect("load policy");
+        remove_policy_file(&path);
+
+        let error = engine
+            .check_journal_unit_allowed("nginx.service")
+            .expect_err("journal scope should use journal.allowed_units when present");
+        assert_eq!(error.code, ErrorCode::PolicyDenied);
+        assert_eq!(
+            error.details.get("policy_section"),
+            Some(&serde_json::json!("journal.allowed_units"))
+        );
+
+        engine
+            .check_journal_unit_allowed("adminbotd.service")
+            .expect("journal.allowed_units should allow adminbotd.service");
     }
 
     #[test]

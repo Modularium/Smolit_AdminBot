@@ -1230,6 +1230,58 @@ allowed_units = ["nginx.service"]
     }
 
     #[test]
+    fn journal_query_uses_journal_specific_allowlist_when_configured() {
+        let app = App::new(policy_for_current_user(
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "__USER__"
+allowed_capabilities = ["journal_read"]
+
+[actions]
+allowed = ["journal.query"]
+denied = []
+
+[service_control]
+allowed_units = ["nginx.service"]
+
+[journal]
+allowed_units = ["adminbotd.service"]
+"#,
+        ));
+
+        let denied = app.handle_request(
+            Request {
+                version: 1,
+                request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62599".to_string(),
+                requested_by: RequestedBy {
+                    origin_type: RequestOriginType::Human,
+                    id: "test-cli".to_string(),
+                },
+                action: "journal.query".to_string(),
+                params: serde_json::from_value(json!({
+                    "unit": "nginx.service",
+                    "limit": 10
+                }))
+                .expect("params"),
+                dry_run: false,
+                timeout_ms: 3000,
+            },
+            current_peer(),
+        );
+        match denied {
+            Response::Error(error) => {
+                assert_eq!(
+                    error.error.details.get("policy_section"),
+                    Some(&json!("journal.allowed_units"))
+                );
+            }
+            Response::Success(success) => panic!("unexpected success response: {:?}", success),
+        }
+    }
+
+    #[test]
     fn system_health_returns_expected_check_set() {
         let app = App::new(policy_for_current_user(
             r#"

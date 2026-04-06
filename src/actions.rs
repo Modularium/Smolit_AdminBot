@@ -100,21 +100,21 @@ const ACTIONS: &[ActionMetadata] = &[
     },
     ActionMetadata {
         name: "journal.query",
-        required_capability: Capability::ReadSensitive,
+        required_capability: Capability::JournalRead,
         risk: RiskLevel::R1,
         privilege_requirement: PrivilegeRequirement::Elevated,
         handler: ActionHandler::JournalQuery,
     },
     ActionMetadata {
         name: "process.snapshot",
-        required_capability: Capability::ReadSensitive,
+        required_capability: Capability::ProcessRead,
         risk: RiskLevel::R1,
         privilege_requirement: PrivilegeRequirement::Elevated,
         handler: ActionHandler::ProcessSnapshot,
     },
     ActionMetadata {
         name: "service.restart",
-        required_capability: Capability::ServiceControl,
+        required_capability: Capability::ServiceRestart,
         risk: RiskLevel::R2,
         privilege_requirement: PrivilegeRequirement::PrivilegedBackend,
         handler: ActionHandler::ServiceRestart,
@@ -456,7 +456,7 @@ fn validate_params(action: &str, params: &Value, app: &App) -> AppResult<()> {
             let parsed = from_params::<JournalQueryParams>(params)?;
             if let Some(unit) = parsed.unit {
                 validate_unit(&unit)?;
-                app.policy().check_service_unit_allowed(&unit)?;
+                app.policy().check_journal_unit_allowed(&unit)?;
             }
             let _ = parsed.priority_min;
             let limit = parsed.limit.unwrap_or(50);
@@ -691,7 +691,7 @@ fn service_status(request: &Request) -> AppResult<Value> {
 fn journal_query(app: &App, request: &Request) -> AppResult<Value> {
     let params = from_params::<JournalQueryParams>(&request.params_value())?;
     if let Some(unit) = params.unit.as_deref() {
-        app.policy().check_service_unit_allowed(unit)?;
+        app.policy().check_journal_unit_allowed(unit)?;
     }
 
     let cutoff_usec = cutoff_realtime_usec(params.since_seconds.unwrap_or(3600))?;
@@ -1729,17 +1729,17 @@ mod tests {
             ),
             (
                 "journal.query",
-                Capability::ReadSensitive,
+                Capability::JournalRead,
                 ActionHandler::JournalQuery,
             ),
             (
                 "process.snapshot",
-                Capability::ReadSensitive,
+                Capability::ProcessRead,
                 ActionHandler::ProcessSnapshot,
             ),
             (
                 "service.restart",
-                Capability::ServiceControl,
+                Capability::ServiceRestart,
                 ActionHandler::ServiceRestart,
             ),
         ];
