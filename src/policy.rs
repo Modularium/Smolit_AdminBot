@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::actions::ActionMetadata;
 use crate::error::{AppError, AppResult, ErrorCode};
-use crate::peer::{gid_from_group_name, PeerCredentials};
+use crate::peer::{gid_from_group_name, gids_from_username, PeerCredentials};
 use crate::types::{Request, RequestOriginType};
 
 pub const EXPECTED_POLICY_OWNER_UID: u32 = 0;
@@ -55,6 +55,12 @@ struct PolicyFile {
     journal: JournalPolicy,
     #[serde(default)]
     observability: ObservabilityPolicy,
+    #[serde(default)]
+    rate_limit: RateLimitPolicy,
+    #[serde(default)]
+    replay_protection: ReplayProtectionPolicy,
+    #[serde(default)]
+    mutation_safety: MutationSafetyPolicy,
     #[serde(default)]
     constraints: ConstraintsPolicy,
 }
@@ -111,6 +117,39 @@ struct ObservabilityPolicy {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct RateLimitPolicy {
+    enabled: Option<bool>,
+    identity_requests_per_second: Option<u32>,
+    identity_burst: Option<u32>,
+    per_tool_enabled: Option<bool>,
+    tool_requests_per_second: Option<u32>,
+    tool_burst: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayProtectionScope {
+    Mutating,
+    All,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplayProtectionPolicy {
+    enabled: Option<bool>,
+    window_seconds: Option<u64>,
+    scope: Option<ReplayProtectionScope>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MutationSafetyPolicy {
+    require_preview: Option<bool>,
+    preview_window_seconds: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ConstraintsPolicy {
     security_profile: Option<SecurityProfile>,
     default_timeout_ms: Option<u64>,
@@ -152,6 +191,29 @@ pub struct ObservabilityConfig {
     pub hash_requested_by_id: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct RateLimitSettings {
+    pub enabled: bool,
+    pub identity_requests_per_second: u32,
+    pub identity_burst: u32,
+    pub per_tool_enabled: bool,
+    pub tool_requests_per_second: u32,
+    pub tool_burst: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplayProtectionSettings {
+    pub enabled: bool,
+    pub window_seconds: u64,
+    pub scope: ReplayProtectionScope,
+}
+
+#[derive(Debug, Clone)]
+pub struct MutationSafetySettings {
+    pub require_preview: bool,
+    pub preview_window_seconds: u64,
+}
+
 impl Default for Constraints {
     fn default() -> Self {
         Self {
@@ -173,6 +235,38 @@ impl Default for Constraints {
     }
 }
 
+impl Default for RateLimitSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            identity_requests_per_second: 8,
+            identity_burst: 16,
+            per_tool_enabled: true,
+            tool_requests_per_second: 4,
+            tool_burst: 8,
+        }
+    }
+}
+
+impl Default for ReplayProtectionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            window_seconds: 60,
+            scope: ReplayProtectionScope::Mutating,
+        }
+    }
+}
+
+impl Default for MutationSafetySettings {
+    fn default() -> Self {
+        Self {
+            require_preview: true,
+            preview_window_seconds: 60,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct PolicySanityWarning {
     pub code: String,
@@ -184,6 +278,7 @@ pub struct PolicySanityWarning {
 pub struct PolicyInspection {
     pub warnings: Vec<PolicySanityWarning>,
     pub fail_on_sanity_warnings: bool,
+    pub effective_identities: Vec<EffectiveIdentityCapabilities>,
 }
 
 impl PolicyInspection {
@@ -203,15 +298,28 @@ pub struct PolicySnapshot {
     max_restarts_per_hour: u32,
     constraints: Constraints,
     observability: ObservabilityConfig,
+    rate_limit: RateLimitSettings,
+    replay_protection: ReplayProtectionSettings,
+    mutation_safety: MutationSafetySettings,
     clients: Vec<ClientEntry>,
 }
 
 #[derive(Debug, Clone)]
 struct ClientEntry {
+    name: String,
     unix_user: Option<String>,
     unix_group: Option<String>,
     group_gid: Option<u32>,
     allowed_capabilities: HashSet<Capability>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct EffectiveIdentityCapabilities {
+    pub unix_user: String,
+    pub group_membership_resolved: bool,
+    pub matching_entries: Vec<String>,
+    pub effective_capabilities: Vec<String>,
+    pub capability_union_leak_detected: bool,
 }
 
 #[derive(Debug, Default)]
@@ -257,10 +365,7 @@ impl PolicyEngine {
     ) -> Result<PolicyInspection, Box<dyn std::error::Error>> {
         let parsed = parse_policy_file(path)?;
         let snapshot = snapshot_from_parsed(parsed)?;
-        Ok(PolicyInspection {
-            warnings: collect_policy_sanity_warnings(&snapshot),
-            fail_on_sanity_warnings: snapshot.constraints.fail_on_sanity_warnings,
-        })
+        Ok(build_policy_inspection(&snapshot))
     }
 
     pub fn load_from_path(path: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
@@ -295,15 +400,28 @@ impl PolicyEngine {
         &self.snapshot.observability
     }
 
+    pub fn rate_limit(&self) -> &RateLimitSettings {
+        &self.snapshot.rate_limit
+    }
+
+    pub fn replay_protection(&self) -> &ReplayProtectionSettings {
+        &self.snapshot.replay_protection
+    }
+
+    pub fn mutation_safety(&self) -> &MutationSafetySettings {
+        &self.snapshot.mutation_safety
+    }
+
     pub fn sanity_warnings(&self) -> Vec<PolicySanityWarning> {
         collect_policy_sanity_warnings(&self.snapshot)
     }
 
+    pub fn sanity_inspection(&self) -> PolicyInspection {
+        build_policy_inspection(&self.snapshot)
+    }
+
     pub fn enforce_sanity_guards(&self) -> AppResult<()> {
-        let inspection = PolicyInspection {
-            warnings: self.sanity_warnings(),
-            fail_on_sanity_warnings: self.snapshot.constraints.fail_on_sanity_warnings,
-        };
+        let inspection = self.sanity_inspection();
         if inspection.would_fail_closed() {
             let mut error = AppError::new(
                 ErrorCode::PreconditionFailed,
@@ -863,7 +981,9 @@ fn parse_policy_file(path: &std::path::Path) -> Result<PolicyFile, Box<dyn std::
 
 fn snapshot_from_parsed(parsed: PolicyFile) -> Result<PolicySnapshot, Box<dyn std::error::Error>> {
     let mut clients = Vec::new();
-    for (client_name, client) in parsed.clients {
+    let mut parsed_clients: Vec<_> = parsed.clients.into_iter().collect();
+    parsed_clients.sort_by(|left, right| left.0.cmp(&right.0));
+    for (client_name, client) in parsed_clients {
         if !client.allowed_request_types.is_empty() {
             return Err(Box::new(
                 AppError::new(
@@ -880,6 +1000,7 @@ fn snapshot_from_parsed(parsed: PolicyFile) -> Result<PolicySnapshot, Box<dyn st
             None => None,
         };
         clients.push(ClientEntry {
+            name: client_name,
             unix_user: client.unix_user,
             unix_group: client.unix_group,
             group_gid,
@@ -943,6 +1064,65 @@ fn snapshot_from_parsed(parsed: PolicyFile) -> Result<PolicySnapshot, Box<dyn st
             }),
         fail_on_sanity_warnings: parsed.constraints.fail_on_sanity_warnings.unwrap_or(false),
     };
+    let default_rate_limit = RateLimitSettings::default();
+    let rate_limit = RateLimitSettings {
+        enabled: parsed
+            .rate_limit
+            .enabled
+            .unwrap_or(default_rate_limit.enabled),
+        identity_requests_per_second: parsed
+            .rate_limit
+            .identity_requests_per_second
+            .unwrap_or(default_rate_limit.identity_requests_per_second)
+            .max(1),
+        identity_burst: parsed
+            .rate_limit
+            .identity_burst
+            .unwrap_or(default_rate_limit.identity_burst)
+            .max(1),
+        per_tool_enabled: parsed
+            .rate_limit
+            .per_tool_enabled
+            .unwrap_or(default_rate_limit.per_tool_enabled),
+        tool_requests_per_second: parsed
+            .rate_limit
+            .tool_requests_per_second
+            .unwrap_or(default_rate_limit.tool_requests_per_second)
+            .max(1),
+        tool_burst: parsed
+            .rate_limit
+            .tool_burst
+            .unwrap_or(default_rate_limit.tool_burst)
+            .max(1),
+    };
+    let default_replay_protection = ReplayProtectionSettings::default();
+    let replay_protection = ReplayProtectionSettings {
+        enabled: parsed
+            .replay_protection
+            .enabled
+            .unwrap_or(default_replay_protection.enabled),
+        window_seconds: parsed
+            .replay_protection
+            .window_seconds
+            .unwrap_or((constraints.replay_window_ms / 1000).max(1))
+            .max(1),
+        scope: parsed
+            .replay_protection
+            .scope
+            .unwrap_or(default_replay_protection.scope),
+    };
+    let default_mutation_safety = MutationSafetySettings::default();
+    let mutation_safety = MutationSafetySettings {
+        require_preview: parsed
+            .mutation_safety
+            .require_preview
+            .unwrap_or(default_mutation_safety.require_preview),
+        preview_window_seconds: parsed
+            .mutation_safety
+            .preview_window_seconds
+            .unwrap_or(default_mutation_safety.preview_window_seconds)
+            .max(1),
+    };
 
     Ok(PolicySnapshot {
         actions_allowed: parsed.actions.allowed.into_iter().collect(),
@@ -959,6 +1139,9 @@ fn snapshot_from_parsed(parsed: PolicyFile) -> Result<PolicySnapshot, Box<dyn st
         observability: ObservabilityConfig {
             hash_requested_by_id: parsed.observability.hash_requested_by_id,
         },
+        rate_limit,
+        replay_protection,
+        mutation_safety,
         clients,
     })
 }
@@ -1024,7 +1207,117 @@ fn collect_policy_sanity_warnings(snapshot: &PolicySnapshot) -> Vec<PolicySanity
         });
     }
 
+    let has_group_selectors = snapshot
+        .clients
+        .iter()
+        .any(|client| client.unix_group.is_some());
+    for identity in collect_effective_identity_capabilities(snapshot) {
+        if !identity.group_membership_resolved && has_group_selectors {
+            warnings.push(PolicySanityWarning {
+                code: "identity_group_resolution_unavailable".to_string(),
+                policy_section: "clients.*.unix_user".to_string(),
+                message: format!(
+                    "unix_user {} could not be fully checked against group-based client entries on this host",
+                    identity.unix_user
+                ),
+            });
+        }
+        if identity.capability_union_leak_detected {
+            warnings.push(PolicySanityWarning {
+                code: "identity_capability_union_leak".to_string(),
+                policy_section: "clients.*".to_string(),
+                message: format!(
+                    "unix_user {} matches multiple policy entries ({}) and receives an effective capability union [{}] that no single matching entry grants alone",
+                    identity.unix_user,
+                    identity.matching_entries.join(", "),
+                    identity.effective_capabilities.join(", ")
+                ),
+            });
+        }
+    }
+
     warnings
+}
+
+fn build_policy_inspection(snapshot: &PolicySnapshot) -> PolicyInspection {
+    PolicyInspection {
+        warnings: collect_policy_sanity_warnings(snapshot),
+        fail_on_sanity_warnings: snapshot.constraints.fail_on_sanity_warnings,
+        effective_identities: collect_effective_identity_capabilities(snapshot),
+    }
+}
+
+fn collect_effective_identity_capabilities(
+    snapshot: &PolicySnapshot,
+) -> Vec<EffectiveIdentityCapabilities> {
+    let mut unix_users: Vec<_> = snapshot
+        .clients
+        .iter()
+        .filter_map(|client| client.unix_user.clone())
+        .collect();
+    unix_users.sort();
+    unix_users.dedup();
+
+    let mut reports = Vec::new();
+    for unix_user in unix_users {
+        let direct_matches: Vec<_> = snapshot
+            .clients
+            .iter()
+            .filter(|client| client.unix_user.as_deref() == Some(unix_user.as_str()))
+            .collect();
+        let group_membership = gids_from_username(&unix_user).ok().flatten();
+
+        let mut matching_entries: Vec<_> = direct_matches.iter().map(|client| *client).collect();
+        if let Some(group_ids) = &group_membership {
+            for client in &snapshot.clients {
+                if let Some(group_gid) = client.group_gid {
+                    if group_ids.contains(&group_gid)
+                        && !matching_entries
+                            .iter()
+                            .any(|existing| existing.name == client.name)
+                    {
+                        matching_entries.push(client);
+                    }
+                }
+            }
+        }
+
+        matching_entries.sort_by(|left, right| left.name.cmp(&right.name));
+        let effective_capability_set = union_capabilities(matching_entries.iter().copied());
+        let capability_union_leak_detected = matching_entries.len() > 1
+            && !matching_entries
+                .iter()
+                .any(|client| effective_capability_set.is_subset(&client.allowed_capabilities));
+
+        reports.push(EffectiveIdentityCapabilities {
+            unix_user,
+            group_membership_resolved: group_membership.is_some(),
+            matching_entries: matching_entries
+                .iter()
+                .map(|client| client.name.clone())
+                .collect(),
+            effective_capabilities: sorted_capability_names(&effective_capability_set),
+            capability_union_leak_detected,
+        });
+    }
+
+    reports
+}
+
+fn union_capabilities<'a>(
+    clients: impl IntoIterator<Item = &'a ClientEntry>,
+) -> HashSet<Capability> {
+    let mut capabilities = HashSet::new();
+    for client in clients {
+        capabilities.extend(client.allowed_capabilities.iter().copied());
+    }
+    capabilities
+}
+
+fn sorted_capability_names(capabilities: &HashSet<Capability>) -> Vec<String> {
+    let mut names: Vec<_> = capabilities.iter().map(ToString::to_string).collect();
+    names.sort();
+    names
 }
 
 impl std::fmt::Display for Capability {
@@ -1056,6 +1349,7 @@ fn capability_satisfies(granted: Capability, required: Capability) -> bool {
 mod tests {
     use super::*;
 
+    use std::ffi::CStr;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -1087,6 +1381,20 @@ mod tests {
 
     fn current_uid() -> u32 {
         unsafe { libc::geteuid() }
+    }
+
+    fn current_username() -> String {
+        let passwd = unsafe { libc::getpwuid(current_uid()) };
+        assert!(!passwd.is_null(), "current user must resolve");
+        let name = unsafe { CStr::from_ptr((*passwd).pw_name) };
+        name.to_string_lossy().into_owned()
+    }
+
+    fn current_primary_group_name() -> String {
+        let group = unsafe { libc::getgrgid(libc::getegid()) };
+        assert!(!group.is_null(), "current group must resolve");
+        let name = unsafe { CStr::from_ptr((*group).gr_name) };
+        name.to_string_lossy().into_owned()
     }
 
     fn write_restart_state_file(contents: &str) -> PathBuf {
@@ -1201,6 +1509,20 @@ max_parallel_mutations = 1
             12
         );
         assert_eq!(engine.snapshot.constraints.replay_window_ms, 300_000);
+        assert!(engine.snapshot.rate_limit.enabled);
+        assert_eq!(engine.snapshot.rate_limit.identity_requests_per_second, 8);
+        assert_eq!(engine.snapshot.rate_limit.identity_burst, 16);
+        assert!(engine.snapshot.rate_limit.per_tool_enabled);
+        assert_eq!(engine.snapshot.rate_limit.tool_requests_per_second, 4);
+        assert_eq!(engine.snapshot.rate_limit.tool_burst, 8);
+        assert!(engine.snapshot.replay_protection.enabled);
+        assert_eq!(engine.snapshot.replay_protection.window_seconds, 300);
+        assert_eq!(
+            engine.snapshot.replay_protection.scope,
+            ReplayProtectionScope::Mutating
+        );
+        assert!(engine.snapshot.mutation_safety.require_preview);
+        assert_eq!(engine.snapshot.mutation_safety.preview_window_seconds, 60);
         assert_eq!(engine.snapshot.clients.len(), 2);
 
         let service_operator = engine
@@ -1213,6 +1535,61 @@ max_parallel_mutations = 1
         assert!(service_operator
             .allowed_capabilities
             .contains(&Capability::ServiceControl));
+    }
+
+    #[test]
+    fn loads_agent_hardening_sections_from_policy() {
+        let path = write_policy_file(
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "dev"
+allowed_capabilities = ["read_basic", "service_control"]
+
+[actions]
+allowed = ["system.status", "service.restart"]
+denied = []
+
+[service_control]
+allowed_units = ["nginx.service"]
+
+[rate_limit]
+enabled = true
+identity_requests_per_second = 5
+identity_burst = 10
+per_tool_enabled = true
+tool_requests_per_second = 2
+tool_burst = 4
+
+[replay_protection]
+enabled = true
+window_seconds = 45
+scope = "all"
+
+[mutation_safety]
+require_preview = true
+preview_window_seconds = 30
+"#,
+        );
+
+        let engine = PolicyEngine::load_from_path(path.clone()).expect("load policy");
+        remove_policy_file(&path);
+
+        assert!(engine.snapshot.rate_limit.enabled);
+        assert_eq!(engine.snapshot.rate_limit.identity_requests_per_second, 5);
+        assert_eq!(engine.snapshot.rate_limit.identity_burst, 10);
+        assert!(engine.snapshot.rate_limit.per_tool_enabled);
+        assert_eq!(engine.snapshot.rate_limit.tool_requests_per_second, 2);
+        assert_eq!(engine.snapshot.rate_limit.tool_burst, 4);
+        assert!(engine.snapshot.replay_protection.enabled);
+        assert_eq!(engine.snapshot.replay_protection.window_seconds, 45);
+        assert_eq!(
+            engine.snapshot.replay_protection.scope,
+            ReplayProtectionScope::All
+        );
+        assert!(engine.snapshot.mutation_safety.require_preview);
+        assert_eq!(engine.snapshot.mutation_safety.preview_window_seconds, 30);
     }
 
     #[test]
@@ -1353,6 +1730,58 @@ allowed_units = ["nginx.service"]
     }
 
     #[test]
+    fn inspect_policy_reports_agent_human_capability_union_overlap() {
+        let unix_user = current_username();
+        let unix_group = current_primary_group_name();
+        let path = write_policy_file(&format!(
+            r#"
+version = 1
+
+[clients.agentnn_adminbot]
+unix_user = "{unix_user}"
+allowed_capabilities = ["read_basic"]
+
+[clients.human_operator_group]
+unix_group = "{unix_group}"
+allowed_capabilities = ["service_restart"]
+
+[actions]
+allowed = ["system.status", "service.restart"]
+denied = []
+
+[service_control]
+allowed_units = ["nginx.service"]
+"#
+        ));
+
+        let inspection = PolicyEngine::inspect_policy_file(&path).expect("inspect policy");
+        remove_policy_file(&path);
+
+        assert!(inspection
+            .warnings
+            .iter()
+            .any(|warning| warning.code == "identity_capability_union_leak"));
+        let report = inspection
+            .effective_identities
+            .iter()
+            .find(|identity| identity.unix_user == unix_user)
+            .expect("effective identity report");
+        assert!(report.group_membership_resolved);
+        assert!(report.capability_union_leak_detected);
+        assert_eq!(
+            report.matching_entries,
+            vec![
+                "agentnn_adminbot".to_string(),
+                "human_operator_group".to_string()
+            ]
+        );
+        assert_eq!(
+            report.effective_capabilities,
+            vec!["read_basic".to_string(), "service_restart".to_string()]
+        );
+    }
+
+    #[test]
     fn sanity_guard_fails_closed_when_policy_requests_it() {
         let path = write_policy_file(
             r#"
@@ -1385,6 +1814,47 @@ fail_on_sanity_warnings = true
         assert_eq!(
             error.details.get("first_warning_code"),
             Some(&serde_json::json!("legacy_read_sensitive_capability"))
+        );
+    }
+
+    #[test]
+    fn sanity_guard_fails_closed_for_agent_human_capability_union_overlap() {
+        let unix_user = current_username();
+        let unix_group = current_primary_group_name();
+        let path = write_policy_file(&format!(
+            r#"
+version = 1
+
+[clients.agentnn_adminbot]
+unix_user = "{unix_user}"
+allowed_capabilities = ["read_basic"]
+
+[clients.human_operator_group]
+unix_group = "{unix_group}"
+allowed_capabilities = ["service_restart"]
+
+[actions]
+allowed = ["system.status", "service.restart"]
+denied = []
+
+[service_control]
+allowed_units = ["nginx.service"]
+
+[constraints]
+fail_on_sanity_warnings = true
+"#
+        ));
+
+        let engine = PolicyEngine::load_from_path(path.clone()).expect("load policy");
+        let error = engine
+            .enforce_sanity_guards()
+            .expect_err("sanity guard should fail closed");
+        remove_policy_file(&path);
+
+        assert_eq!(error.code, ErrorCode::PreconditionFailed);
+        assert_eq!(
+            error.details.get("first_warning_code"),
+            Some(&serde_json::json!("identity_capability_union_leak"))
         );
     }
 
@@ -1535,10 +2005,13 @@ allowed = ["service.status"]
         let request = Request {
             version: 1,
             request_id: "b398e7a0-ae50-4a60-aef1-8e7b38eb84cf".to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "local-cli".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "service.status".to_string(),
             params: serde_json::Map::new(),
             dry_run: false,
@@ -1590,10 +2063,13 @@ allowed_units = ["nginx.service"]
         let journal_request = Request {
             version: 1,
             request_id: "b398e7a0-ae50-4a60-aef1-8e7b38eb84d0".to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "local-cli".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "journal.query".to_string(),
             params: serde_json::Map::new(),
             dry_run: false,
@@ -1644,10 +2120,13 @@ allowed_units = ["nginx.service"]
         let request = Request {
             version: 1,
             request_id: "b398e7a0-ae50-4a60-aef1-8e7b38eb84d2".to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "local-cli".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "service.restart".to_string(),
             params: serde_json::Map::new(),
             dry_run: false,
@@ -1827,10 +2306,13 @@ allowed_units = ["nginx.service"]
         let human_request = Request {
             version: 1,
             request_id: "adf4db77-6f76-4ff2-aa21-3ef7f2d8ff92".to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "human-cli".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "service.restart".to_string(),
             params: serde_json::Map::new(),
             dry_run: true,
@@ -1840,10 +2322,13 @@ allowed_units = ["nginx.service"]
         let agent_request = Request {
             version: 1,
             request_id: "5f507fc6-d61f-4c45-b40f-d9fd253d2052".to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Agent,
                 id: "agentnn-adminbot-agent".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "service.restart".to_string(),
             params: serde_json::Map::new(),
             dry_run: true,
@@ -1888,10 +2373,13 @@ allowed = ["system.status"]
         let mut request = Request {
             version: 1,
             request_id: "5348f356-6c80-4c27-b93a-e4436a725663".to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "cli-a".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "system.status".to_string(),
             params: serde_json::Map::new(),
             dry_run: false,

@@ -260,12 +260,32 @@ fn execute_command<R: BufRead, W: Write>(
             params.insert("unit".to_string(), json!(unit));
             params.insert("mode".to_string(), json!("safe"));
             params.insert("reason".to_string(), json!(reason));
-            let success = execute_ipc_with_dry_run(
-                parsed.socket_path.as_path(),
-                "service.restart",
-                params,
-                dry_run,
-            )?;
+            let success = if dry_run {
+                execute_ipc_with_context(
+                    parsed.socket_path.as_path(),
+                    "service.restart",
+                    params,
+                    true,
+                    Some(Uuid::new_v4().to_string()),
+                )?
+            } else {
+                let correlation_id = Uuid::new_v4().to_string();
+                let preview_params = params.clone();
+                let _preview = execute_ipc_with_context(
+                    parsed.socket_path.as_path(),
+                    "service.restart",
+                    preview_params,
+                    true,
+                    Some(correlation_id.clone()),
+                )?;
+                execute_ipc_with_context(
+                    parsed.socket_path.as_path(),
+                    "service.restart",
+                    params,
+                    false,
+                    Some(correlation_id),
+                )?
+            };
             output_result(
                 stdout,
                 json,
@@ -303,22 +323,26 @@ fn execute_ipc(
     action: &str,
     params: Map<String, Value>,
 ) -> Result<SuccessResponse, CliError> {
-    execute_ipc_with_dry_run(socket_path, action, params, false)
+    execute_ipc_with_context(socket_path, action, params, false, None)
 }
 
-fn execute_ipc_with_dry_run(
+fn execute_ipc_with_context(
     socket_path: &Path,
     action: &str,
     params: Map<String, Value>,
     dry_run: bool,
+    correlation_id: Option<String>,
 ) -> Result<SuccessResponse, CliError> {
     let request = Request {
         version: 1,
         request_id: Uuid::new_v4().to_string(),
+        correlation_id,
         requested_by: RequestedBy {
             origin_type: RequestOriginType::Human,
             id: CLI_ID.to_string(),
         },
+        tool_name: None,
+        agent_run_id: None,
         action: action.to_string(),
         params,
         dry_run,
@@ -367,6 +391,7 @@ struct PolicyValidationReport {
     deployment_checks_valid: Option<bool>,
     fail_on_sanity_warnings: bool,
     warnings: Vec<crate::policy::PolicySanityWarning>,
+    effective_identities: Vec<crate::policy::EffectiveIdentityCapabilities>,
 }
 
 impl PolicyValidationReport {
@@ -395,6 +420,7 @@ fn validate_policy(path: &Path) -> Result<PolicyValidationReport, CliError> {
         deployment_checks_valid,
         fail_on_sanity_warnings: inspection.fail_on_sanity_warnings,
         warnings: inspection.warnings,
+        effective_identities: inspection.effective_identities,
     })
 }
 
@@ -417,6 +443,20 @@ fn render_policy_report_human(report: &PolicyValidationReport) -> String {
             lines.push(format!(
                 "- {} ({}): {}",
                 warning.code, warning.policy_section, warning.message
+            ));
+        }
+    }
+
+    if !report.effective_identities.is_empty() {
+        lines.push("Effective identities:".to_string());
+        for identity in &report.effective_identities {
+            lines.push(format!(
+                "- {} -> entries [{}], capabilities [{}], group_membership_resolved={}, union_leak={}",
+                identity.unix_user,
+                identity.matching_entries.join(", "),
+                identity.effective_capabilities.join(", "),
+                identity.group_membership_resolved,
+                identity.capability_union_leak_detected
             ));
         }
     }
@@ -863,6 +903,7 @@ impl Command {
 mod tests {
     use super::*;
 
+    use std::ffi::CStr;
     use std::fs;
     use std::io::Cursor;
     use std::path::PathBuf;
@@ -872,6 +913,20 @@ mod tests {
     use crate::app::App;
     use crate::ipc::IpcServer;
     use crate::policy::PolicyEngine;
+
+    fn current_username() -> String {
+        let passwd = unsafe { libc::getpwuid(libc::geteuid()) };
+        assert!(!passwd.is_null(), "current user must resolve");
+        let name = unsafe { CStr::from_ptr((*passwd).pw_name) };
+        name.to_string_lossy().into_owned()
+    }
+
+    fn current_primary_group_name() -> String {
+        let group = unsafe { libc::getgrgid(libc::getegid()) };
+        assert!(!group.is_null(), "current group must resolve");
+        let name = unsafe { CStr::from_ptr((*group).gr_name) };
+        name.to_string_lossy().into_owned()
+    }
 
     #[test]
     fn status_json_smoke_works_against_test_server() {
@@ -1092,6 +1147,60 @@ fail_on_sanity_warnings = true
         assert!(output["report"]["warnings"]
             .as_array()
             .is_some_and(|warnings| !warnings.is_empty()));
+        let _ = fs::remove_file(policy_path);
+    }
+
+    #[test]
+    fn policy_validate_shows_effective_capabilities_for_identity_overlap() {
+        let unix_user = current_username();
+        let unix_group = current_primary_group_name();
+        let policy_path = write_temp_file(
+            "policy-identity-overlap",
+            &format!(
+                r#"
+version = 1
+
+[clients.agentnn_adminbot]
+unix_user = "{unix_user}"
+allowed_capabilities = ["read_basic"]
+
+[clients.human_operator_group]
+unix_group = "{unix_group}"
+allowed_capabilities = ["service_restart"]
+
+[actions]
+allowed = ["system.status", "service.restart"]
+denied = []
+
+[service_control]
+allowed_units = ["nginx.service"]
+"#
+            ),
+        );
+
+        let mut stdin = Cursor::new(Vec::<u8>::new());
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit_code = run_with(
+            vec![
+                "adminbotctl".to_string(),
+                "policy".to_string(),
+                "validate".to_string(),
+                "--path".to_string(),
+                policy_path.display().to_string(),
+            ],
+            &mut stdin,
+            &mut stdout,
+            &mut stderr,
+            false,
+        );
+
+        assert_eq!(exit_code, 0);
+        let output = String::from_utf8(stdout).expect("utf8 stdout");
+        assert!(output.contains("identity_capability_union_leak"));
+        assert!(output.contains("Effective identities:"));
+        assert!(output.contains(&unix_user));
+        assert!(output.contains("union_leak=true"));
         let _ = fs::remove_file(policy_path);
     }
 

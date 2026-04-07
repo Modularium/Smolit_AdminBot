@@ -4,9 +4,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use libc::iovec;
-use sha2::{Digest, Sha256};
 use serde_json::json;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::error::AppError;
 use crate::peer::PeerCredentials;
@@ -199,6 +199,7 @@ fn build_journald_fields(
         cstring_field("ADMINBOT_EVENT_KIND", "audit"),
         cstring_field("ADMINBOT_REQUEST_ID", &event.request.request_id),
         cstring_field("ADMINBOT_ACTION", &event.request.action),
+        cstring_field("ADMINBOT_TOOL_NAME", event.request.effective_tool_name()),
         cstring_field("ADMINBOT_STAGE", stage_value(event.stage)),
         cstring_field(
             "ADMINBOT_REQUESTED_BY_TYPE",
@@ -212,7 +213,19 @@ fn build_journald_fields(
         cstring_field("ADMINBOT_POLICY_DECISION", access.policy),
         cstring_field("ADMINBOT_CAPABILITY_DECISION", access.capability),
         cstring_field("ADMINBOT_RESULT", event.result),
+        cstring_field("ADMINBOT_RATE_LIMIT_HIT", bool_value(rate_limit_hit(event))),
+        cstring_field(
+            "ADMINBOT_REPLAY_DETECTED",
+            bool_value(replay_detected(event)),
+        ),
     ];
+
+    if let Some(correlation_id) = &event.request.correlation_id {
+        fields.push(cstring_field("ADMINBOT_CORRELATION_ID", correlation_id));
+    }
+    if let Some(agent_run_id) = &event.request.agent_run_id {
+        fields.push(cstring_field("ADMINBOT_AGENT_RUN_ID", agent_run_id));
+    }
 
     if config.hash_requested_by_id {
         fields.push(cstring_field(
@@ -286,6 +299,7 @@ fn fallback_json(
     let mut entry = json!({
         "request_id": event.request.request_id,
         "action": event.request.action,
+        "tool_name": event.request.effective_tool_name(),
         "stage": stage_value(event.stage),
         "requested_by": {
             "type": event.request.requested_by.origin_type
@@ -303,8 +317,17 @@ fn fallback_json(
         "capability": {
             "decision": access.capability
         },
-        "result": event.result
+        "result": event.result,
+        "rate_limit_hit": rate_limit_hit(event),
+        "replay_detected": replay_detected(event)
     });
+
+    if let Some(correlation_id) = &event.request.correlation_id {
+        entry["correlation_id"] = json!(correlation_id);
+    }
+    if let Some(agent_run_id) = &event.request.agent_run_id {
+        entry["agent_run_id"] = json!(agent_run_id);
+    }
 
     if config.hash_requested_by_id {
         entry["requested_by"]["id_hash"] = json!(hash_string(&event.request.requested_by.id));
@@ -430,6 +453,20 @@ fn bool_value(value: bool) -> &'static str {
     } else {
         "false"
     }
+}
+
+fn rate_limit_hit(event: &AuditEvent<'_>) -> bool {
+    matches!(
+        event.error.map(|error| error.code),
+        Some(crate::error::ErrorCode::RateLimited)
+    )
+}
+
+fn replay_detected(event: &AuditEvent<'_>) -> bool {
+    matches!(
+        event.error.map(|error| error.code),
+        Some(crate::error::ErrorCode::ReplayDetected)
+    )
 }
 
 struct AccessDecisions {
@@ -802,7 +839,9 @@ mod tests {
             .into_iter()
             .map(|field| field.into_string().expect("utf8"))
             .collect::<Vec<_>>();
-        assert!(!fields.iter().any(|field| field == "ADMINBOT_REQUESTED_BY_ID=local-cli"));
+        assert!(!fields
+            .iter()
+            .any(|field| field == "ADMINBOT_REQUESTED_BY_ID=local-cli"));
         assert!(fields
             .iter()
             .any(|field| field.starts_with("ADMINBOT_REQUESTED_BY_ID_HASH=")));
@@ -815,14 +854,43 @@ mod tests {
         assert!(json["requested_by"]["id_hash"].as_str().is_some());
     }
 
+    #[test]
+    fn fallback_json_includes_agent_hardening_fields() {
+        let mut request = test_request();
+        request.tool_name = Some("adminbot_restart_service".to_string());
+        request.agent_run_id = Some("agent-run-42".to_string());
+        request.correlation_id = Some("incident-2026-04-07-001".to_string());
+        let peer = test_peer();
+        let error = AppError::new(ErrorCode::ReplayDetected, "duplicate request")
+            .with_detail("replay_detected", true);
+        let event = AuditEvent {
+            request: &request,
+            peer: &peer,
+            stage: AuditStage::Completed,
+            decision: AuditDecision::Deny,
+            result: "error",
+            error: Some(&error),
+        };
+
+        let json = fallback_json(&event, &default_observability(), false);
+        assert_eq!(json["tool_name"], "adminbot_restart_service");
+        assert_eq!(json["agent_run_id"], "agent-run-42");
+        assert_eq!(json["correlation_id"], "incident-2026-04-07-001");
+        assert_eq!(json["rate_limit_hit"], false);
+        assert_eq!(json["replay_detected"], true);
+    }
+
     fn test_request() -> Request {
         Request {
             version: 1,
             request_id: "test-request-id".to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "local-cli".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "system.status".to_string(),
             params: serde_json::Map::new(),
             dry_run: false,

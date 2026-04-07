@@ -68,6 +68,58 @@ pub fn gid_from_group_name(name: &str) -> io::Result<Option<u32>> {
     Ok(Some(gid))
 }
 
+pub fn gids_from_username(name: &str) -> io::Result<Option<Vec<u32>>> {
+    let c_name = CString::new(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid user name"))?;
+    let passwd = unsafe { libc::getpwnam(c_name.as_ptr()) };
+    if passwd.is_null() {
+        return Ok(None);
+    }
+
+    let primary_gid = unsafe { (*passwd).pw_gid };
+
+    let mut group_count: libc::c_int = 0;
+    unsafe {
+        libc::getgrouplist(
+            c_name.as_ptr(),
+            primary_gid,
+            std::ptr::null_mut(),
+            &mut group_count,
+        );
+    }
+
+    if group_count <= 0 {
+        return Ok(Some(vec![primary_gid]));
+    }
+
+    let mut groups = vec![0 as libc::gid_t; group_count as usize];
+    let result = unsafe {
+        libc::getgrouplist(
+            c_name.as_ptr(),
+            primary_gid,
+            groups.as_mut_ptr(),
+            &mut group_count,
+        )
+    };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+
+    groups.truncate(group_count as usize);
+    let mut resolved = Vec::new();
+    for gid in groups {
+        let gid = gid as u32;
+        if !resolved.contains(&gid) {
+            resolved.push(gid);
+        }
+    }
+    if !resolved.contains(&primary_gid) {
+        resolved.push(primary_gid);
+    }
+
+    Ok(Some(resolved))
+}
+
 pub fn set_socket_group(path: &std::path::Path, group_name: &str) -> io::Result<()> {
     let Some(gid) = gid_from_group_name(group_name)? else {
         return Err(io::Error::new(

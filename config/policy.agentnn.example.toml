@@ -1,0 +1,44 @@
+version = 1
+
+# Human and agent identities must stay non-overlapping in Policy.
+# Capabilities are unioned across all matching client entries.
+# If the agent user needs socket access through a shared group, do not
+# reuse that same group as a higher-privilege Policy selector.
+
+[clients.local_operator]
+unix_user = "dev"
+allowed_capabilities = ["read_basic", "service_read", "service_restart"]
+
+[clients.agentnn_adminbot]
+unix_user = "agentnn"
+allowed_capabilities = ["read_basic", "service_read", "journal_read"]
+
+[actions]
+allowed = [
+  "system.status",
+  "system.health",
+  "service.status",
+  "journal.query",
+  "service.restart",
+]
+denied = []
+
+[service_control]
+allowed_units = ["nginx.service"]
+restart_cooldown_seconds = 300
+max_restarts_per_hour = 3
+
+[constraints]
+default_timeout_ms = 3000
+max_timeout_ms = 30000
+journal_limit_max = 50
+process_limit_max = 25
+max_parallel_mutations = 1
+read_rate_limit_window_ms = 1000
+read_requests_per_peer_per_window = 30
+global_read_requests_per_window = 120
+mutate_rate_limit_window_ms = 60000
+mutate_requests_per_peer_per_window = 4
+global_mutate_requests_per_window = 12
+replay_window_ms = 300000
+fail_on_sanity_warnings = false

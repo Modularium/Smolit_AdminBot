@@ -6,7 +6,7 @@ use crate::actions::{self, ActionHandler, ActionMetadata};
 use crate::audit::AuditLogger;
 use crate::error::{AppError, ErrorCode};
 use crate::peer::PeerCredentials;
-use crate::policy::PolicyEngine;
+use crate::policy::{PolicyEngine, ReplayProtectionScope};
 use crate::types::{Request, Response};
 
 #[derive(Debug)]
@@ -33,6 +33,12 @@ struct RateLimitConfig {
     global_limit: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TokenBucketConfig {
+    refill_per_second: f64,
+    burst: f64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct PeerRateKey {
     uid: u32,
@@ -44,18 +50,34 @@ struct RateLimitWindow {
     hits: VecDeque<Instant>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct TokenBucketState {
+    tokens: f64,
+    last_refill: Instant,
+}
+
 #[derive(Debug, Default)]
 struct RequestRateLimiterState {
     global_read: RateLimitWindow,
     global_mutate: RateLimitWindow,
     per_peer_read: HashMap<PeerRateKey, RateLimitWindow>,
     per_peer_mutate: HashMap<PeerRateKey, RateLimitWindow>,
+    per_identity: HashMap<String, TokenBucketState>,
+    per_identity_tool: HashMap<IdentityToolRateKey, TokenBucketState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct IdentityToolRateKey {
+    identity: String,
+    tool: String,
 }
 
 #[derive(Debug)]
 struct RequestRateLimiter {
     read: RateLimitConfig,
     mutate: RateLimitConfig,
+    identity: Option<TokenBucketConfig>,
+    identity_tool: Option<TokenBucketConfig>,
     state: Mutex<RequestRateLimiterState>,
 }
 
@@ -80,7 +102,6 @@ enum ReplayEntry {
     },
     Completed {
         fingerprint: Vec<u8>,
-        response: Response,
         completed_at: Instant,
     },
 }
@@ -88,7 +109,6 @@ enum ReplayEntry {
 #[derive(Debug)]
 enum ReplayDecision {
     Execute(ReplayReservation),
-    ReturnCached(Response),
 }
 
 #[derive(Debug)]
@@ -98,12 +118,33 @@ struct ReplayReservation {
 }
 
 #[derive(Debug)]
+struct PreviewProtector {
+    entries: Mutex<HashMap<PreviewKey, PreviewEntry>>,
+    preview_window: Duration,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PreviewKey {
+    peer_uid: u32,
+    peer_gid: u32,
+    action: String,
+    correlation_id: String,
+}
+
+#[derive(Debug)]
+struct PreviewEntry {
+    fingerprint: Vec<u8>,
+    observed_at: Instant,
+}
+
+#[derive(Debug)]
 pub struct App {
     policy: PolicyEngine,
     audit: AuditLogger,
     request_rate_limiter: RequestRateLimiter,
     mutation_limiter: MutationLimiter,
     replay_protector: ReplayProtector,
+    preview_protector: PreviewProtector,
 }
 
 impl MutationLimiter {
@@ -147,6 +188,7 @@ impl Drop for MutationPermit<'_> {
 impl RequestRateLimiter {
     fn from_policy(policy: &PolicyEngine) -> Self {
         let constraints = policy.constraints();
+        let hardening = policy.rate_limit();
         Self {
             read: RateLimitConfig {
                 window: Duration::from_millis(constraints.read_rate_limit_window_ms.max(1)),
@@ -158,16 +200,33 @@ impl RequestRateLimiter {
                 per_peer_limit: constraints.mutate_requests_per_peer_per_window.max(1) as usize,
                 global_limit: constraints.global_mutate_requests_per_window.max(1) as usize,
             },
+            identity: hardening.enabled.then_some(TokenBucketConfig {
+                refill_per_second: hardening.identity_requests_per_second.max(1) as f64,
+                burst: hardening.identity_burst.max(1) as f64,
+            }),
+            identity_tool: (hardening.enabled && hardening.per_tool_enabled).then_some(
+                TokenBucketConfig {
+                    refill_per_second: hardening.tool_requests_per_second.max(1) as f64,
+                    burst: hardening.tool_burst.max(1) as f64,
+                },
+            ),
             state: Mutex::new(RequestRateLimiterState::default()),
         }
     }
 
-    fn check(&self, request_class: RequestClass, peer: &PeerCredentials) -> Result<(), AppError> {
+    fn check(
+        &self,
+        request_class: RequestClass,
+        request: &Request,
+        peer: &PeerCredentials,
+    ) -> Result<(), AppError> {
         let now = Instant::now();
         let key = PeerRateKey {
             uid: peer.uid,
             gid: peer.gid,
         };
+        let identity = rate_limit_identity(peer);
+        let tool = request.effective_tool_name().to_string();
 
         let mut guard = self
             .state
@@ -183,7 +242,7 @@ impl RequestRateLimiter {
                     request_class,
                     key,
                     now,
-                )
+                )?;
             }
             RequestClass::Mutate => {
                 let state = &mut *guard;
@@ -194,9 +253,45 @@ impl RequestRateLimiter {
                     request_class,
                     key,
                     now,
-                )
+                )?;
             }
         }
+
+        if let Some(config) = self.identity {
+            consume_token(
+                guard
+                    .per_identity
+                    .entry(identity.clone())
+                    .or_insert_with(|| TokenBucketState::new(config.burst, now)),
+                config,
+                now,
+                request_class,
+                "identity",
+                &identity,
+                request.effective_tool_name(),
+            )?;
+        }
+
+        if let Some(config) = self.identity_tool {
+            let tool_key = IdentityToolRateKey {
+                identity: identity.clone(),
+                tool: tool.clone(),
+            };
+            consume_token(
+                guard
+                    .per_identity_tool
+                    .entry(tool_key)
+                    .or_insert_with(|| TokenBucketState::new(config.burst, now)),
+                config,
+                now,
+                request_class,
+                "identity_tool",
+                &identity,
+                &tool,
+            )?;
+        }
+
+        Ok(())
     }
 }
 
@@ -229,28 +324,23 @@ impl ReplayProtector {
                 fingerprint: existing,
                 ..
             }) => {
-                if *existing == fingerprint {
-                    return Err(AppError::new(
-                        ErrorCode::RateLimited,
-                        "mutating request replay is already in progress",
-                    )
-                    .with_detail("request_id", request.request_id.clone())
-                    .with_detail("replay_window_ms", self.replay_window.as_millis() as u64)
-                    .retryable(true));
-                }
-
-                return Err(replay_mismatch_error(request, self.replay_window));
+                return Err(replay_detected_error(
+                    request,
+                    self.replay_window,
+                    *existing != fingerprint,
+                    "in_flight",
+                ));
             }
             Some(ReplayEntry::Completed {
                 fingerprint: existing,
-                response,
                 ..
             }) => {
-                if *existing == fingerprint {
-                    return Ok(ReplayDecision::ReturnCached(response.clone()));
-                }
-
-                return Err(replay_mismatch_error(request, self.replay_window));
+                return Err(replay_detected_error(
+                    request,
+                    self.replay_window,
+                    *existing != fingerprint,
+                    "completed",
+                ));
             }
             None => {}
         }
@@ -283,7 +373,7 @@ impl ReplayProtector {
         }
     }
 
-    fn complete(&self, reservation: ReplayReservation, response: &Response) {
+    fn complete(&self, reservation: ReplayReservation, _response: &Response) {
         let mut guard = self
             .entries
             .lock()
@@ -292,7 +382,6 @@ impl ReplayProtector {
             reservation.key,
             ReplayEntry::Completed {
                 fingerprint: reservation.fingerprint,
-                response: response.clone(),
                 completed_at: Instant::now(),
             },
         );
@@ -309,9 +398,72 @@ impl ReplayEntry {
     }
 }
 
+impl PreviewProtector {
+    fn new(preview_window: Duration) -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            preview_window,
+        }
+    }
+
+    fn record(&self, request: &Request, peer: &PeerCredentials) -> Result<(), AppError> {
+        let key = preview_key(request, peer)?;
+        let fingerprint = preview_fingerprint(request)?;
+        let now = Instant::now();
+        let mut guard = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let preview_window = self.preview_window;
+        guard.retain(|_, entry| now.duration_since(entry.observed_at) < preview_window);
+        guard.insert(
+            key,
+            PreviewEntry {
+                fingerprint,
+                observed_at: now,
+            },
+        );
+        Ok(())
+    }
+
+    fn consume(&self, request: &Request, peer: &PeerCredentials) -> Result<(), AppError> {
+        let key = preview_key(request, peer)?;
+        let fingerprint = preview_fingerprint(request)?;
+        let now = Instant::now();
+        let mut guard = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let preview_window = self.preview_window;
+        guard.retain(|_, entry| now.duration_since(entry.observed_at) < preview_window);
+
+        let Some(existing) = guard.remove(&key) else {
+            return Err(AppError::new(
+                ErrorCode::PreconditionFailed,
+                "mutating request requires a prior preview with the same correlation_id",
+            )
+            .with_detail("correlation_id", key.correlation_id)
+            .with_detail("preview_required", true));
+        };
+
+        if existing.fingerprint != fingerprint {
+            return Err(AppError::new(
+                ErrorCode::PreconditionFailed,
+                "preview does not match the requested mutation payload",
+            )
+            .with_detail("correlation_id", key.correlation_id)
+            .with_detail("preview_required", true));
+        }
+
+        Ok(())
+    }
+}
+
 impl App {
     pub fn new(policy: PolicyEngine) -> Self {
-        let replay_window = Duration::from_millis(policy.constraints().replay_window_ms.max(1));
+        let replay_window = Duration::from_secs(policy.replay_protection().window_seconds.max(1));
+        let preview_window =
+            Duration::from_secs(policy.mutation_safety().preview_window_seconds.max(1));
         let observability = policy.observability().clone();
         let request_rate_limiter = RequestRateLimiter::from_policy(&policy);
         let mutation_limiter = MutationLimiter::new(policy.constraints().max_parallel_mutations);
@@ -321,6 +473,7 @@ impl App {
             request_rate_limiter,
             mutation_limiter,
             replay_protector: ReplayProtector::new(replay_window),
+            preview_protector: PreviewProtector::new(preview_window),
         }
     }
 
@@ -344,11 +497,11 @@ impl App {
     fn execute(&self, request: &Request, peer: &PeerCredentials) -> Result<Response, AppError> {
         let metadata = actions::validate_request_shape(request, self)?;
         self.request_rate_limiter
-            .check(classify_request(request, &metadata), peer)?;
+            .check(classify_request(request, &metadata), request, peer)?;
         self.policy.authorize(request, &metadata, peer)?;
 
-        if requires_mutation_permit(request, &metadata) {
-            return self.execute_mutating_request(request, peer, &metadata);
+        if requires_replay_protection(&self.policy, request, &metadata) {
+            return self.execute_replay_protected_request(request, peer, &metadata);
         }
 
         self.audit.log_received(request, peer);
@@ -373,14 +526,17 @@ impl App {
         self.mutation_limiter.try_acquire()
     }
 
-    fn execute_mutating_request(
+    fn execute_replay_protected_request(
         &self,
         request: &Request,
         peer: &PeerCredentials,
         metadata: &ActionMetadata,
     ) -> Result<Response, AppError> {
+        if requires_preview_guard(&self.policy, request, metadata) {
+            self.preview_protector.consume(request, peer)?;
+        }
+
         let reservation = match self.replay_protector.begin(request, peer)? {
-            ReplayDecision::ReturnCached(response) => return Ok(response),
             ReplayDecision::Execute(reservation) => reservation,
         };
 
@@ -402,6 +558,9 @@ impl App {
         self.audit.log_received(request, peer);
         match actions::execute(self, request) {
             Ok(result) => {
+                if is_preview_request(request, metadata) {
+                    self.preview_protector.record(request, peer)?;
+                }
                 let response = Response::success(request.request_id.clone(), result);
                 self.replay_protector.complete(reservation, &response);
                 Ok(response)
@@ -500,11 +659,86 @@ fn rate_limit_error(
         .with_detail("scope", scope)
         .with_detail("limit", limit as u64)
         .with_detail("window_ms", window.as_millis() as u64)
+        .with_detail("rate_limit_hit", true)
         .retryable(true)
+}
+
+impl TokenBucketState {
+    fn new(burst: f64, now: Instant) -> Self {
+        Self {
+            tokens: burst,
+            last_refill: now,
+        }
+    }
+}
+
+fn consume_token(
+    bucket: &mut TokenBucketState,
+    config: TokenBucketConfig,
+    now: Instant,
+    request_class: RequestClass,
+    scope: &'static str,
+    identity: &str,
+    tool_name: &str,
+) -> Result<(), AppError> {
+    let elapsed = now.duration_since(bucket.last_refill).as_secs_f64();
+    bucket.tokens = (bucket.tokens + elapsed * config.refill_per_second).min(config.burst);
+    bucket.last_refill = now;
+    if bucket.tokens < 1.0 {
+        return Err(
+            AppError::new(ErrorCode::RateLimited, "request rate limit exceeded")
+                .with_detail(
+                    "request_class",
+                    match request_class {
+                        RequestClass::Read => "read",
+                        RequestClass::Mutate => "mutate",
+                    },
+                )
+                .with_detail("scope", scope)
+                .with_detail("identity", identity)
+                .with_detail("tool_name", tool_name)
+                .with_detail("rate_limit_hit", true)
+                .with_detail("refill_per_second", config.refill_per_second)
+                .with_detail("burst", config.burst)
+                .retryable(true),
+        );
+    }
+    bucket.tokens -= 1.0;
+    Ok(())
 }
 
 fn requires_mutation_permit(request: &Request, metadata: &ActionMetadata) -> bool {
     !request.dry_run && matches!(metadata.handler, ActionHandler::ServiceRestart)
+}
+
+fn requires_replay_protection(
+    policy: &PolicyEngine,
+    request: &Request,
+    metadata: &ActionMetadata,
+) -> bool {
+    let config = policy.replay_protection();
+    if !config.enabled {
+        return false;
+    }
+
+    match config.scope {
+        ReplayProtectionScope::Mutating => requires_mutation_permit(request, metadata),
+        ReplayProtectionScope::All => true,
+    }
+}
+
+fn is_preview_request(request: &Request, metadata: &ActionMetadata) -> bool {
+    request.dry_run && matches!(metadata.handler, ActionHandler::ServiceRestart)
+}
+
+fn requires_preview_guard(
+    policy: &PolicyEngine,
+    request: &Request,
+    metadata: &ActionMetadata,
+) -> bool {
+    policy.mutation_safety().require_preview
+        && !request.dry_run
+        && matches!(metadata.handler, ActionHandler::ServiceRestart)
 }
 
 fn replay_fingerprint(request: &Request) -> Result<Vec<u8>, AppError> {
@@ -517,13 +751,60 @@ fn replay_fingerprint(request: &Request) -> Result<Vec<u8>, AppError> {
     })
 }
 
-fn replay_mismatch_error(request: &Request, replay_window: Duration) -> AppError {
+fn preview_fingerprint(request: &Request) -> Result<Vec<u8>, AppError> {
+    serde_json::to_vec(&serde_json::json!({
+        "action": request.action,
+        "tool_name": request.effective_tool_name(),
+        "params": request.params_value(),
+    }))
+    .map_err(|error| {
+        AppError::new(
+            ErrorCode::ExecutionFailed,
+            "unable to encode preview fingerprint",
+        )
+        .with_detail("source", error.to_string())
+    })
+}
+
+fn preview_key(request: &Request, peer: &PeerCredentials) -> Result<PreviewKey, AppError> {
+    let correlation_id = request.correlation_id.clone().ok_or_else(|| {
+        AppError::new(
+            ErrorCode::PreconditionFailed,
+            "mutating request requires correlation_id for preview linkage",
+        )
+        .with_detail("preview_required", true)
+    })?;
+
+    Ok(PreviewKey {
+        peer_uid: peer.uid,
+        peer_gid: peer.gid,
+        action: request.action.clone(),
+        correlation_id,
+    })
+}
+
+fn replay_detected_error(
+    request: &Request,
+    replay_window: Duration,
+    fingerprint_mismatch: bool,
+    replay_stage: &'static str,
+) -> AppError {
     AppError::new(
-        ErrorCode::ValidationError,
-        "request_id is already bound to a different mutating request",
+        ErrorCode::ReplayDetected,
+        "request_id was already observed within the replay protection window",
     )
     .with_detail("request_id", request.request_id.clone())
     .with_detail("replay_window_ms", replay_window.as_millis() as u64)
+    .with_detail("replay_detected", true)
+    .with_detail("replay_stage", replay_stage)
+    .with_detail("fingerprint_mismatch", fingerprint_mismatch)
+}
+
+fn rate_limit_identity(peer: &PeerCredentials) -> String {
+    peer.unix_user
+        .as_ref()
+        .map(|user| format!("unix_user:{user}"))
+        .unwrap_or_else(|| format!("uid:{}:gid:{}", peer.uid, peer.gid))
 }
 
 #[cfg(test)]
@@ -559,10 +840,13 @@ denied = []
         let request = Request {
             version: 1,
             request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62571".to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "test-cli".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "system.status".to_string(),
             params: serde_json::from_value(json!({})).expect("params"),
             dry_run: false,
@@ -618,7 +902,10 @@ global_read_requests_per_window = 10
         match third {
             Response::Error(error) => {
                 assert_eq!(error.error.code.to_string(), "rate_limited");
-                assert_eq!(error.error.details.get("request_class"), Some(&json!("read")));
+                assert_eq!(
+                    error.error.details.get("request_class"),
+                    Some(&json!("read"))
+                );
                 assert_eq!(error.error.details.get("scope"), Some(&json!("per_peer")));
             }
             Response::Success(success) => panic!("unexpected success response: {:?}", success),
@@ -664,7 +951,10 @@ global_read_requests_per_window = 2
         match third {
             Response::Error(error) => {
                 assert_eq!(error.error.code.to_string(), "rate_limited");
-                assert_eq!(error.error.details.get("request_class"), Some(&json!("read")));
+                assert_eq!(
+                    error.error.details.get("request_class"),
+                    Some(&json!("read"))
+                );
                 assert_eq!(error.error.details.get("scope"), Some(&json!("global")));
             }
             Response::Success(success) => panic!("unexpected success response: {:?}", success),
@@ -695,10 +985,13 @@ max_restarts_per_hour = 3
         let request = Request {
             version: 1,
             request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62572".to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "test-cli".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "service.restart".to_string(),
             params: serde_json::from_value(json!({
                 "unit": "nginx.service",
@@ -851,7 +1144,10 @@ global_mutate_requests_per_window = 10
         match second {
             Response::Error(error) => {
                 assert_eq!(error.error.code.to_string(), "rate_limited");
-                assert_eq!(error.error.details.get("request_class"), Some(&json!("mutate")));
+                assert_eq!(
+                    error.error.details.get("request_class"),
+                    Some(&json!("mutate"))
+                );
                 assert_eq!(error.error.details.get("scope"), Some(&json!("per_peer")));
             }
             Response::Success(success) => panic!("unexpected success response: {:?}", success),
@@ -917,7 +1213,10 @@ global_mutate_requests_per_window = 2
         match third {
             Response::Error(error) => {
                 assert_eq!(error.error.code.to_string(), "rate_limited");
-                assert_eq!(error.error.details.get("request_class"), Some(&json!("mutate")));
+                assert_eq!(
+                    error.error.details.get("request_class"),
+                    Some(&json!("mutate"))
+                );
                 assert_eq!(error.error.details.get("scope"), Some(&json!("global")));
             }
             Response::Success(success) => panic!("unexpected success response: {:?}", success),
@@ -925,7 +1224,7 @@ global_mutate_requests_per_window = 2
     }
 
     #[test]
-    fn completed_mutating_replay_returns_cached_response() {
+    fn completed_mutating_replay_is_rejected() {
         let unit = "adminbot-missing-replay.service";
         let app = App::new(service_restart_policy_for_current_user(unit));
         let request = service_restart_request(unit, false);
@@ -936,10 +1235,21 @@ global_mutate_requests_per_window = 2
             .expect("hold mutation slot after first response");
         let second = app.handle_request(request, current_peer());
 
-        assert_eq!(
-            serde_json::to_value(&first).expect("serialize first"),
-            serde_json::to_value(&second).expect("serialize second")
-        );
+        assert!(matches!(first, Response::Error(_)));
+        match second {
+            Response::Error(error) => {
+                assert_eq!(error.error.code, crate::error::ErrorCode::ReplayDetected);
+                assert_eq!(
+                    error.error.details.get("replay_detected"),
+                    Some(&json!(true))
+                );
+                assert_eq!(
+                    error.error.details.get("fingerprint_mismatch"),
+                    Some(&json!(false))
+                );
+            }
+            Response::Success(success) => panic!("unexpected success response: {:?}", success),
+        }
     }
 
     #[test]
@@ -960,14 +1270,18 @@ global_mutate_requests_per_window = 2
 
         match response {
             Response::Error(error) => {
-                assert_eq!(error.error.code, crate::error::ErrorCode::ValidationError);
+                assert_eq!(error.error.code, crate::error::ErrorCode::ReplayDetected);
                 assert_eq!(
                     error.error.message,
-                    "request_id is already bound to a different mutating request"
+                    "request_id was already observed within the replay protection window"
                 );
                 assert_eq!(
                     error.error.details.get("request_id"),
                     Some(&json!("2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62572"))
+                );
+                assert_eq!(
+                    error.error.details.get("fingerprint_mismatch"),
+                    Some(&json!(true))
                 );
             }
             Response::Success(success) => panic!("unexpected success response: {:?}", success),
@@ -975,25 +1289,24 @@ global_mutate_requests_per_window = 2
     }
 
     #[test]
-    fn in_flight_mutating_replay_is_retryable_rate_limited() {
+    fn in_flight_mutating_replay_is_rejected() {
         let protector = ReplayProtector::new(Duration::from_millis(300_000));
         let peer = current_peer();
         let request = service_restart_request("adminbot-inflight-missing.service", false);
 
         let _reservation = match protector.begin(&request, &peer).expect("begin first") {
             ReplayDecision::Execute(reservation) => reservation,
-            ReplayDecision::ReturnCached(_) => panic!("first request must not be cached"),
         };
 
         let error = protector
             .begin(&request, &peer)
             .expect_err("in-flight duplicate must fail");
-        assert_eq!(error.code, crate::error::ErrorCode::RateLimited);
+        assert_eq!(error.code, crate::error::ErrorCode::ReplayDetected);
         assert_eq!(
             error.message,
-            "mutating request replay is already in progress"
+            "request_id was already observed within the replay protection window"
         );
-        assert_eq!(error.retryable, true);
+        assert_eq!(error.details.get("replay_stage"), Some(&json!("in_flight")));
     }
 
     #[test]
@@ -1004,14 +1317,111 @@ global_mutate_requests_per_window = 2
 
         let _reservation = match protector.begin(&request, &peer).expect("begin first") {
             ReplayDecision::Execute(reservation) => reservation,
-            ReplayDecision::ReturnCached(_) => panic!("first request must not be cached"),
         };
 
         let error = protector
             .begin(&request, &peer)
             .expect_err("in-flight duplicate must fail");
-        assert_eq!(error.code, crate::error::ErrorCode::RateLimited);
+        assert_eq!(error.code, crate::error::ErrorCode::ReplayDetected);
         assert_eq!(error.details.get("replay_window_ms"), Some(&json!(60_000)));
+    }
+
+    #[test]
+    fn identity_tool_rate_limit_rejects_burst_above_token_bucket() {
+        let app = App::new(policy_for_current_user(
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "__USER__"
+allowed_capabilities = ["read_basic"]
+
+[actions]
+allowed = ["system.status"]
+denied = []
+
+[rate_limit]
+enabled = true
+identity_requests_per_second = 100
+identity_burst = 100
+per_tool_enabled = true
+tool_requests_per_second = 1
+tool_burst = 1
+"#,
+        ));
+
+        let first = app.handle_request(
+            system_status_request("2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62650"),
+            current_peer(),
+        );
+        let second = app.handle_request(
+            system_status_request("2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62651"),
+            current_peer(),
+        );
+
+        assert!(matches!(first, Response::Success(_)));
+        match second {
+            Response::Error(error) => {
+                assert_eq!(error.error.code, crate::error::ErrorCode::RateLimited);
+                assert_eq!(
+                    error.error.details.get("scope"),
+                    Some(&json!("identity_tool"))
+                );
+                assert_eq!(
+                    error.error.details.get("rate_limit_hit"),
+                    Some(&json!(true))
+                );
+                assert_eq!(
+                    error.error.details.get("tool_name"),
+                    Some(&json!("system.status"))
+                );
+            }
+            Response::Success(success) => panic!("unexpected success response: {:?}", success),
+        }
+    }
+
+    #[test]
+    fn service_restart_without_preview_is_rejected_when_guard_enabled() {
+        let unit = existing_service_unit();
+        let app = App::new(policy_for_current_user(&format!(
+            r#"
+version = 1
+
+[clients.local_cli]
+unix_user = "__USER__"
+allowed_capabilities = ["service_control"]
+
+[actions]
+allowed = ["service.restart"]
+denied = []
+
+[service_control]
+allowed_units = ["{unit}"]
+restart_cooldown_seconds = 300
+max_restarts_per_hour = 3
+
+[mutation_safety]
+require_preview = true
+preview_window_seconds = 60
+"#
+        )));
+
+        let request = service_restart_request(unit, false);
+        let response = app.handle_request(request, current_peer());
+
+        match response {
+            Response::Error(error) => {
+                assert_eq!(
+                    error.error.code,
+                    crate::error::ErrorCode::PreconditionFailed
+                );
+                assert_eq!(
+                    error.error.details.get("preview_required"),
+                    Some(&json!(true))
+                );
+            }
+            Response::Success(success) => panic!("unexpected success response: {:?}", success),
+        }
     }
 
     #[test]
@@ -1029,8 +1439,11 @@ global_mutate_requests_per_window = 2
             handles.push(thread::spawn(move || {
                 let _permit = app.hold_mutation_slot_for_test().ok();
                 barrier.wait();
-                let response =
-                    app.handle_request(service_restart_request(unit, false), current_peer());
+                let request_id = uuid::Uuid::new_v4().to_string();
+                let response = app.handle_request(
+                    service_restart_request_with_id(unit, false, &request_id),
+                    current_peer(),
+                );
                 barrier.wait();
                 response
             }));
@@ -1074,10 +1487,13 @@ denied = []
         let request = Request {
             version: 1,
             request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62573".to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "test-cli".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "network.interface_status".to_string(),
             params: serde_json::from_value(json!({
                 "interfaces": ["lo"]
@@ -1120,10 +1536,13 @@ denied = []
         let request = Request {
             version: 1,
             request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62574".to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "test-cli".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "service.status".to_string(),
             params: serde_json::from_value(json!({
                 "unit": existing_service_unit()
@@ -1165,10 +1584,13 @@ denied = []
         let request = Request {
             version: 1,
             request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62575".to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "test-cli".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "service.status".to_string(),
             params: serde_json::from_value(json!({
                 "unit": "invalid-unit"
@@ -1212,10 +1634,13 @@ allowed_units = ["nginx.service"]
         let request = Request {
             version: 1,
             request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62575".to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "test-cli".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "journal.query".to_string(),
             params: serde_json::from_value(json!({
                 "unit": "sshd.service",
@@ -1268,10 +1693,13 @@ allowed_units = ["adminbotd.service"]
             Request {
                 version: 1,
                 request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62599".to_string(),
+                correlation_id: None,
                 requested_by: RequestedBy {
                     origin_type: RequestOriginType::Human,
                     id: "test-cli".to_string(),
                 },
+                tool_name: None,
+                agent_run_id: None,
                 action: "journal.query".to_string(),
                 params: serde_json::from_value(json!({
                     "unit": "nginx.service",
@@ -1313,10 +1741,13 @@ denied = []
         let request = Request {
             version: 1,
             request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62576".to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "test-cli".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "system.health".to_string(),
             params: serde_json::from_value(json!({})).expect("params"),
             dry_run: false,
@@ -1361,10 +1792,13 @@ denied = []
         let request = Request {
             version: 1,
             request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62577".to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "test-cli".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "system.health".to_string(),
             params: serde_json::from_value(json!({})).expect("params"),
             dry_run: false,
@@ -1417,10 +1851,13 @@ denied = []
         let request = Request {
             version: 1,
             request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62578".to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "test-cli".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "resource.snapshot".to_string(),
             params: serde_json::from_value(json!({})).expect("params"),
             dry_run: false,
@@ -1483,10 +1920,13 @@ denied = []
         let request = Request {
             version: 1,
             request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62579".to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "test-cli".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "resource.snapshot".to_string(),
             params: serde_json::from_value(json!({
                 "include": ["cpu", "history"]
@@ -1530,10 +1970,13 @@ allowed_mounts = ["/"]
         let request = Request {
             version: 1,
             request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62580".to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "test-cli".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "disk.usage".to_string(),
             params: serde_json::from_value(json!({
                 "mounts": ["/"]
@@ -1580,10 +2023,13 @@ allowed_mounts = ["/"]
         let request = Request {
             version: 1,
             request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62581".to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "test-cli".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "disk.usage".to_string(),
             params: serde_json::from_value(json!({
                 "mounts": ["/var"]
@@ -1633,10 +2079,13 @@ allowed_mounts = ["/definitely-missing-adminbot-mount"]
         let request = Request {
             version: 1,
             request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62582".to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "test-cli".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "disk.usage".to_string(),
             params: serde_json::from_value(json!({
                 "mounts": ["/definitely-missing-adminbot-mount"]
@@ -1685,10 +2134,13 @@ process_limit_max = 10
         let request = Request {
             version: 1,
             request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62583".to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "test-cli".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "process.snapshot".to_string(),
             params: serde_json::from_value(json!({
                 "top_by": "memory",
@@ -1744,10 +2196,13 @@ process_limit_max = 10
         Request {
             version: 1,
             request_id: request_id.to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "test-cli".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "system.status".to_string(),
             params: serde_json::from_value(json!({})).expect("params"),
             dry_run: false,
@@ -1807,6 +2262,9 @@ allowed_units = [{allowed_units}]
 restart_cooldown_seconds = 300
 max_restarts_per_hour = 3
 
+[mutation_safety]
+require_preview = false
+
 [constraints]
 max_parallel_mutations = {max_parallel_mutations}
 "#
@@ -1823,10 +2281,13 @@ max_parallel_mutations = {max_parallel_mutations}
         Request {
             version: 1,
             request_id: request_id.to_string(),
+            correlation_id: Some(format!("test-correlation-{request_id}")),
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "test-cli".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "service.restart".to_string(),
             params: serde_json::from_value(json!({
                 "unit": unit,

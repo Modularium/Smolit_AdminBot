@@ -23,7 +23,13 @@ pub struct RequestedBy {
 pub struct Request {
     pub version: u32,
     pub request_id: String,
+    #[serde(default)]
+    pub correlation_id: Option<String>,
     pub requested_by: RequestedBy,
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    #[serde(default)]
+    pub agent_run_id: Option<String>,
     pub action: String,
     pub params: Map<String, Value>,
     pub dry_run: bool,
@@ -33,6 +39,10 @@ pub struct Request {
 impl Request {
     pub fn params_value(&self) -> Value {
         Value::Object(self.params.clone())
+    }
+
+    pub fn effective_tool_name(&self) -> &str {
+        self.tool_name.as_deref().unwrap_or(self.action.as_str())
     }
 }
 
@@ -85,10 +95,13 @@ mod tests {
         let request = Request {
             version: 1,
             request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62571".to_string(),
+            correlation_id: Some("incident-2026-04-07-001".to_string()),
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "local-cli".to_string(),
             },
+            tool_name: Some("adminbot_get_status".to_string()),
+            agent_run_id: Some("agent-run-001".to_string()),
             action: "system.status".to_string(),
             params: Map::new(),
             dry_run: false,
@@ -98,8 +111,11 @@ mod tests {
         let encoded = serde_json::to_value(&request).expect("serialize request");
         assert_eq!(encoded["version"], 1);
         assert_eq!(encoded["request_id"], request.request_id);
+        assert_eq!(encoded["correlation_id"], "incident-2026-04-07-001");
         assert_eq!(encoded["requested_by"]["type"], "human");
         assert_eq!(encoded["requested_by"]["id"], "local-cli");
+        assert_eq!(encoded["tool_name"], "adminbot_get_status");
+        assert_eq!(encoded["agent_run_id"], "agent-run-001");
         assert_eq!(encoded["action"], "system.status");
         assert_eq!(encoded["dry_run"], false);
         assert_eq!(encoded["timeout_ms"], 3000);
@@ -117,11 +133,14 @@ mod tests {
         let payload = serde_json::json!({
             "version": 1,
             "request_id": "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62571",
+            "correlation_id": "incident-2026-04-07-001",
             "requested_by": {
                 "type": "human",
                 "id": "local-cli",
                 "extra": true
             },
+            "tool_name": "adminbot_get_status",
+            "agent_run_id": "agent-run-001",
             "action": "system.status",
             "params": {},
             "dry_run": false,
@@ -137,10 +156,13 @@ mod tests {
         let payload = serde_json::json!({
             "version": 1,
             "request_id": "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62571",
+            "correlation_id": "incident-2026-04-07-001",
             "requested_by": {
                 "type": "service",
                 "id": "local-cli"
             },
+            "tool_name": "adminbot_get_status",
+            "agent_run_id": "agent-run-001",
             "action": "system.status",
             "params": {},
             "dry_run": false,

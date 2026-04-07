@@ -123,6 +123,13 @@ const ACTIONS: &[ActionMetadata] = &[
 
 pub const MAX_JOURNAL_MESSAGE_BYTES: usize = 2 * 1024;
 pub const MAX_JOURNAL_RESPONSE_BYTES: usize = 32 * 1024;
+const MAX_REQUESTED_BY_ID_LEN: usize = 128;
+const MAX_CORRELATION_ID_LEN: usize = 128;
+const MAX_TOOL_NAME_LEN: usize = 96;
+const MAX_AGENT_RUN_ID_LEN: usize = 128;
+const MAX_SERVICE_RESTART_REASON_LEN: usize = 256;
+const HARD_MAX_JOURNAL_QUERY_LIMIT: u32 = 100;
+const HARD_MAX_JOURNAL_SINCE_SECONDS: u64 = 21_600;
 const JOURNAL_MESSAGE_TRUNCATION_SUFFIX: &str = "... [truncated]";
 
 #[derive(Debug, Deserialize)]
@@ -384,6 +391,8 @@ pub fn validate_request_shape(request: &Request, app: &App) -> AppResult<ActionM
         .with_detail("timeout_ms", request.timeout_ms));
     }
 
+    validate_request_metadata(request, app)?;
+
     validate_params(&request.action, &request.params_value(), app)?;
     Ok(metadata)
 }
@@ -460,17 +469,23 @@ fn validate_params(action: &str, params: &Value, app: &App) -> AppResult<()> {
             }
             let _ = parsed.priority_min;
             let limit = parsed.limit.unwrap_or(50);
-            if limit == 0 || limit > app.policy().constraints().journal_limit_max {
+            let policy_limit = app.policy().constraints().journal_limit_max;
+            let effective_limit = policy_limit.min(HARD_MAX_JOURNAL_QUERY_LIMIT);
+            if limit == 0 || limit > effective_limit {
                 return Err(AppError::new(
                     ErrorCode::ValidationError,
                     "journal limit exceeds policy maximum",
-                ));
+                )
+                .with_detail("limit", limit)
+                .with_detail("hard_max_limit", HARD_MAX_JOURNAL_QUERY_LIMIT)
+                .with_detail("policy_limit", policy_limit));
             }
-            if parsed.since_seconds.unwrap_or(3600) > 86_400 {
+            if parsed.since_seconds.unwrap_or(3600) > HARD_MAX_JOURNAL_SINCE_SECONDS {
                 return Err(AppError::new(
                     ErrorCode::ValidationError,
                     "since_seconds exceeds maximum range",
-                ));
+                )
+                .with_detail("hard_max_since_seconds", HARD_MAX_JOURNAL_SINCE_SECONDS));
             }
         }
         "process.snapshot" => {
@@ -503,6 +518,13 @@ fn validate_params(action: &str, params: &Value, app: &App) -> AppResult<()> {
                     ErrorCode::ValidationError,
                     "restart reason must not be empty",
                 ));
+            }
+            if parsed.reason.len() > MAX_SERVICE_RESTART_REASON_LEN {
+                return Err(AppError::new(
+                    ErrorCode::ValidationError,
+                    "restart reason exceeds maximum length",
+                )
+                .with_detail("max_length", MAX_SERVICE_RESTART_REASON_LEN as u64));
             }
         }
         _ => return Err(AppError::new(ErrorCode::ValidationError, "unknown action")),
@@ -1204,6 +1226,7 @@ fn validate_mount(mount: &str) -> AppResult<()> {
 fn validate_unit(unit: &str) -> AppResult<()> {
     if !unit.ends_with(".service")
         || unit.is_empty()
+        || unit.len() > 128
         || !unit.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_' | '@')
         })
@@ -1211,6 +1234,78 @@ fn validate_unit(unit: &str) -> AppResult<()> {
         return Err(
             AppError::new(ErrorCode::ValidationError, "unit name is invalid")
                 .with_detail("unit", unit.to_string()),
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_request_metadata(request: &Request, app: &App) -> AppResult<()> {
+    validate_identifier_like(
+        &request.requested_by.id,
+        "requested_by.id",
+        MAX_REQUESTED_BY_ID_LEN,
+    )?;
+
+    if let Some(correlation_id) = &request.correlation_id {
+        validate_identifier_like(correlation_id, "correlation_id", MAX_CORRELATION_ID_LEN)?;
+    }
+
+    if let Some(tool_name) = &request.tool_name {
+        validate_tool_name(tool_name)?;
+    }
+
+    if let Some(agent_run_id) = &request.agent_run_id {
+        validate_identifier_like(agent_run_id, "agent_run_id", MAX_AGENT_RUN_ID_LEN)?;
+    }
+
+    if app.policy().mutation_safety().require_preview
+        && !request.dry_run
+        && request.action == "service.restart"
+        && request.correlation_id.is_none()
+    {
+        return Err(AppError::new(
+            ErrorCode::PreconditionFailed,
+            "service.restart requires correlation_id for preview linkage",
+        )
+        .with_detail("field", "correlation_id")
+        .with_detail("preview_required", true));
+    }
+
+    Ok(())
+}
+
+fn validate_identifier_like(value: &str, field: &str, max_len: usize) -> AppResult<()> {
+    if value.is_empty()
+        || value.len() > max_len
+        || !value.chars().all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '-' | '_' | '.' | ':' | '/' | '@')
+        })
+    {
+        return Err(
+            AppError::new(ErrorCode::ValidationError, "request metadata is invalid")
+                .with_detail("field", field.to_string())
+                .with_detail("max_length", max_len as u64),
+        );
+    }
+
+    Ok(())
+}
+
+fn validate_tool_name(tool_name: &str) -> AppResult<()> {
+    if tool_name.is_empty()
+        || tool_name.len() > MAX_TOOL_NAME_LEN
+        || !tool_name.chars().all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '_' | '-' | '.')
+        })
+    {
+        return Err(
+            AppError::new(ErrorCode::ValidationError, "tool_name is invalid")
+                .with_detail("field", "tool_name")
+                .with_detail("max_length", MAX_TOOL_NAME_LEN as u64),
         );
     }
 
@@ -1765,10 +1860,13 @@ mod tests {
         let request = Request {
             version: 1,
             request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62571".to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "registry-test".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "unknown.action".to_string(),
             params: serde_json::from_value(json!({})).expect("params"),
             dry_run: false,
@@ -1787,10 +1885,13 @@ mod tests {
         let request = Request {
             version: 2,
             request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62572".to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "validator-test".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "system.status".to_string(),
             params: serde_json::from_value(json!({})).expect("params"),
             dry_run: false,
@@ -1809,10 +1910,13 @@ mod tests {
         let request = Request {
             version: 1,
             request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62573".to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "validator-test".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "system.status".to_string(),
             params: serde_json::from_value(json!({})).expect("params"),
             dry_run: false,
@@ -1831,10 +1935,13 @@ mod tests {
         let request = Request {
             version: 1,
             request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62574".to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "validator-test".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "system.status".to_string(),
             params: serde_json::from_value(json!({"unexpected": true})).expect("params"),
             dry_run: false,
@@ -1852,10 +1959,13 @@ mod tests {
         let request = Request {
             version: 1,
             request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62575".to_string(),
+            correlation_id: Some("validator-correlation".to_string()),
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "validator-test".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "service.restart".to_string(),
             params: serde_json::from_value(json!({
                 "unit": "nginx.service",
@@ -1878,10 +1988,13 @@ mod tests {
         let request = Request {
             version: 1,
             request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62576".to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "validator-test".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "disk.usage".to_string(),
             params: serde_json::from_value(json!({"mounts": []})).expect("params"),
             dry_run: false,
@@ -1902,10 +2015,13 @@ mod tests {
         let request = Request {
             version: 1,
             request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62577".to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "validator-test".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "journal.query".to_string(),
             params: serde_json::from_value(json!({
                 "limit": 0
@@ -1921,15 +2037,81 @@ mod tests {
     }
 
     #[test]
+    fn validate_request_shape_rejects_journal_limit_above_hard_max() {
+        let app = App::new(policy_for_current_user());
+        let request = Request {
+            version: 1,
+            request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a6257a".to_string(),
+            correlation_id: None,
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Human,
+                id: "validator-test".to_string(),
+            },
+            tool_name: None,
+            agent_run_id: None,
+            action: "journal.query".to_string(),
+            params: serde_json::from_value(json!({
+                "limit": 101
+            }))
+            .expect("params"),
+            dry_run: false,
+            timeout_ms: 3000,
+        };
+
+        let error = validate_request_shape(&request, &app).expect_err("journal hard max violation");
+        assert_eq!(error.code, ErrorCode::ValidationError);
+        assert_eq!(error.message, "journal limit exceeds policy maximum");
+        assert_eq!(
+            error.details.get("hard_max_limit"),
+            Some(&json!(HARD_MAX_JOURNAL_QUERY_LIMIT))
+        );
+    }
+
+    #[test]
+    fn validate_request_shape_rejects_restart_without_correlation_id_when_preview_required() {
+        let app = App::new(policy_for_current_user());
+        let request = Request {
+            version: 1,
+            request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a6257b".to_string(),
+            correlation_id: None,
+            requested_by: RequestedBy {
+                origin_type: RequestOriginType::Human,
+                id: "validator-test".to_string(),
+            },
+            tool_name: None,
+            agent_run_id: None,
+            action: "service.restart".to_string(),
+            params: serde_json::from_value(json!({
+                "unit": "nginx.service",
+                "mode": "safe",
+                "reason": "test"
+            }))
+            .expect("params"),
+            dry_run: false,
+            timeout_ms: 3000,
+        };
+
+        let error = validate_request_shape(&request, &app).expect_err("missing correlation id");
+        assert_eq!(error.code, ErrorCode::PreconditionFailed);
+        assert_eq!(
+            error.message,
+            "service.restart requires correlation_id for preview linkage"
+        );
+    }
+
+    #[test]
     fn validate_request_shape_rejects_zero_process_limit() {
         let app = App::new(policy_for_current_user());
         let request = Request {
             version: 1,
             request_id: "2a6f8f0d-6fa0-4f42-b5d8-6dd9f2a62578".to_string(),
+            correlation_id: None,
             requested_by: RequestedBy {
                 origin_type: RequestOriginType::Human,
                 id: "validator-test".to_string(),
             },
+            tool_name: None,
+            agent_run_id: None,
             action: "process.snapshot".to_string(),
             params: serde_json::from_value(json!({
                 "top_by": "cpu",
