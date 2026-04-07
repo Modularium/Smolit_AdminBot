@@ -45,10 +45,11 @@ Die Promotion von `dev` nach `main` ist fachlich sinnvoll, weil:
 
 ## 4. Ob Promotion erfolgt ist
 
-Status zum Zeitpunkt der Dokumenterstellung:
+Ja.
 
-- Promotion-PR von `dev` nach `main` wurde vorbereitet bzw. erstellt
-- nach dem Merge ist explizit zu pruefen, dass `main` keine alten Python-/Legacy-Artefakte mehr enthaelt
+- PR `#113` `Promote Rust AdminBot v2 from dev to main` wurde erstellt
+- der Pflicht-Check `security-gate` lief auf dem PR gruen
+- anschliessend wurde der PR sauber nach `main` gemerged
 
 ## 5. Ob `main` jetzt bereinigt ist
 
@@ -58,7 +59,10 @@ Vor der Promotion:
 
 Nach der Promotion:
 
-- separat zu verifizieren
+- ja, `main` zeigt jetzt das Rust-/AdminBot-v2-Zielbild
+- `README.md` ist auf das neue Zielbild ausgerichtet
+- `docs/security/*`, `docs/cli/*`, `docs/cleanup/*`, `docs/releases/*` sind vorhanden
+- `adminbotd.service`, `deploy/polkit/*`, `scripts/verify_security_release_gate.sh` und `adminbotctl` sind auf `main` vorhanden
 
 ## 6. Ob noch Altartefakte auf `main` existieren
 
@@ -66,7 +70,13 @@ Vor der Promotion:
 
 - ja, weil `main` den aelteren Stand repraesentierte
 
-Nach der Promotion gilt als Ziel:
+Nach der Promotion:
 
-- `main` soll den gleichen Rust-/AdminBot-v2-Zielstand wie `dev` enthalten
-- kein alter Python-/Legacy-AdminBot-Code soll auf `main` verbleiben
+- keine getrackten `*.py`-Dateien mehr
+- keine alten `rootbot`-/`root_bot`-/Watchdog-/Docker-/ELK-/Prometheus-/AppArmor-/Setup-Artefakte mehr
+- einzig verbliebene Treffer sind dokumentierte historische Referenzen in `README.md`, `docs/adminbot_v2/*` und `docs/cleanup/*`
+- `scripts/send_request.sh` nutzt weiterhin bewusst ein kleines `python3`-Inline-Snippet fuer das aktuelle v2-IPC-Framing; das ist keine alte Python-AdminBot-Implementierung
+
+Fazit:
+
+`main` ist jetzt frei von altem Python-/Legacy-AdminBot-Code und repraesentiert den aktuellen Rust-/AdminBot-v2-Stand.
