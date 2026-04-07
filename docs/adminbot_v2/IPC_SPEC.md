@@ -117,6 +117,9 @@ Grundsatz:
 - Typ: UUID string
 - Pflicht: ja
 - muss pro Request eindeutig sein
+- fuer mutierende Non-Dry-Run-Requests gilt `request_id` zusaetzlich als kurzlebiger Idempotency-Key
+- identische Replays derselben mutierenden Anfrage koennen innerhalb des Replay-Fensters denselben Response zurueckliefern
+- Wiederverwendung derselben `request_id` mit anderem mutierenden Payload ist unzulaessig
 
 ### `correlation_id`
 

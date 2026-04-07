@@ -2,6 +2,18 @@
 
 Minimaler Rust-Startpunkt für `AdminBot v2` als lokaler, deterministischer Linux-Daemon.
 
+## Repository Scope
+
+Dieses Repository bildet jetzt nur noch das aktuelle AdminBot-v2-Zielbild ab:
+
+- Rust-Daemon `adminbotd`
+- Operator-CLI `adminbotctl`
+- versionierte Policy-/polkit-/systemd-Artefakte
+- `docs/adminbot_v2/*` als Architektur- und Protokollreferenz
+- `docs/security/*` als kanonische Sicherheitsdokumentation
+
+Der frühere Python-/`rootbot`-/Watchdog-/Docker-/ELK-Bestand ist bewusst nicht mehr Teil dieses Repositories.
+
 Aktueller Stand:
 
 - Unix Domain Socket IPC mit `u32`-Length-Prefix und JSON
@@ -23,14 +35,59 @@ Aktueller Stand:
 cargo build
 ```
 
+## Operator-CLI
+
+Die minimale Operator-CLI liegt als eigener Binary-Einstieg vor:
+
+```bash
+cargo run --bin adminbotctl -- --help
+```
+
+Unterstuetzte Befehle:
+
+- `adminbotctl status`
+- `adminbotctl health`
+- `adminbotctl policy validate`
+- `adminbotctl gate run --mode artifact|live`
+- `adminbotctl audit tail`
+- `adminbotctl restart --unit <unit> --reason <text> --confirm`
+
+Die vollstaendige Spezifikation und sichere Nutzung liegt unter:
+
+- `docs/cli/adminbotctl.md`
+
+Low-Level-IPC-Testhilfen fuer das v2-Protokoll liegen weiterhin unter:
+
+- `scripts/send_request.sh`
+- `scripts/test_success_case.sh`
+- `scripts/test_policy_deny_case.sh`
+
 ## Policy vorbereiten
 
 ```bash
 sudo install -d -m 0755 /etc/adminbot
 sudo install -m 0644 config/policy.example.toml /etc/adminbot/policy.toml
+sudo chown root:root /etc/adminbot/policy.toml
 ```
 
 Die Beispielpolicy ist bewusst konservativ und gibt dem lokalen Beispielclient nur Read-only-Capabilities.
+Sie vergibt standardmaessig **kein** `read_sensitive` und schaltet weder `journal.query` noch `process.snapshot` oder `service.restart` im Default frei.
+
+`adminbotd` startet fail closed, wenn `/etc/adminbot/policy.toml` nicht root-owned ist oder group-/world-writable bleibt.
+
+## polkit-Artefakt
+
+Die versionierte polkit-Regelvorlage fuer den `service.restart`-Pfad liegt unter:
+
+- `deploy/polkit/50-adminbotd-systemd.rules`
+
+Sie ist bewusst nur fuer den Service-User `adminbot` ausgelegt und oeffnet ausschliesslich die systemd-Aktion `org.freedesktop.systemd1.manage-units`. Die fachliche Freigabe bleibt in AdminBot-Policy und Code.
+
+Wichtig fuer `v1.x`:
+
+- Autorisierung folgt echten lokalen Peer-Credentials (`SO_PEERCRED`, Unix-User, Unix-Gruppen)
+- `requested_by.type` und `requested_by.id` dienen nur Audit, Korrelation und UX
+- wenn Human- und Agent-Rollen unterschiedlich berechtigt sein sollen, muessen sie ueber getrennte Unix-User oder Gruppen getrennt werden
 
 ## Daemon starten
 
@@ -39,17 +96,53 @@ Der Daemon erwartet standardmäßig:
 - Policy: `/etc/adminbot/policy.toml`
 - Socket: `/run/adminbot/adminbot.sock`
 - Socket-Gruppe: `adminbotctl`
+- Restart-Abuse-State: `/var/lib/adminbot/restart_abuse_state.json`
 
 Vor dem Start:
 
 ```bash
-sudo install -d -m 0755 /run/adminbot
+sudo install -d -o adminbot -g adminbot -m 0750 /run/adminbot
 ```
+
+`adminbotd` startet fail closed, wenn `/run/adminbot` nicht das erwartete Runtime-Verzeichnis ist oder wenn unter `/run/adminbot/adminbot.sock` ein unsicheres Alt-Artefakt liegt.
+Fuer `service.restart` gilt zusaetzlich: der Daemon erwartet ein sicheres, beschreibbares State-Artefakt unter `/var/lib/adminbot/restart_abuse_state.json`. Wenn dieses Artefakt untrusted oder nicht persistierbar ist, wird der Restart-Pfad fail closed blockiert.
 
 Dann:
 
 ```bash
 cargo run
+```
+
+## Security Release Gate
+
+Der verbindliche Security-Gate-Check liegt unter:
+
+- `scripts/verify_security_release_gate.sh`
+
+Das Script ist der stabile Repo-/CI-Einstiegspunkt und delegiert intern an:
+
+- `adminbotctl gate run`
+
+Repo-/CI-Check:
+
+```bash
+bash scripts/verify_security_release_gate.sh --mode artifact
+adminbotctl gate run --mode artifact
+```
+
+Dieser Check wird zusaetzlich automatisch in GitHub Actions erzwungen:
+
+- Workflow: `.github/workflows/security-gate.yml`
+- Pflicht fuer Pull Requests
+- Pflicht fuer Pushes auf `dev` und `main`
+
+Ein PR gilt damit nicht als security-sauber, wenn das `artifact`-Gate fehlschlaegt.
+
+Zielsystem-Check:
+
+```bash
+bash scripts/verify_security_release_gate.sh --mode live
+adminbotctl gate run --mode live
 ```
 
 ## Test via Unix Socket

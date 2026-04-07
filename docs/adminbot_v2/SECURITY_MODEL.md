@@ -57,6 +57,8 @@
 - `Agent-NN` erhält in `v1` weiterhin keine `service_control`-Capability
 - kein generischer Root-Helper im Standardpfad
 - Linux Capabilities sind nicht der primäre Mechanismus für `service.restart`
+- `requested_by.type` und `requested_by.id` sind in `v1.x` keine vertrauenswuerdige Autorisierungsquelle
+- Rollenunterschiede zwischen Human und Agent muessen ueber getrennte Unix-User oder Unix-Gruppen modelliert werden, nicht ueber selbstdeklarierte Request-Metadaten
 
 ## Bewertung der Service-Control-Optionen
 
@@ -73,6 +75,7 @@ Nachteile:
 
 - zusätzliche Integrationsarbeit
 - polkit-Regeln müssen sauber und eng formuliert werden
+- die Systemaktion ist grober als AdminBot selbst und muss deshalb durch lokale Policy und feste D-Bus-Semantik nachgeschaerft werden
 
 Entscheidung:
 
@@ -83,6 +86,8 @@ Entscheidung:
   - systemd-Mode nur `"replace"`
   - AdminBot-Mode nur `safe`
   - Mapping `safe -> RestartUnit(unit, "replace")`
+  - polkit-Aktions-ID `org.freedesktop.systemd1.manage-units`
+  - versionierte polkit-Regelvorlage im Repository unter `deploy/polkit/50-adminbotd-systemd.rules`
 - nicht Teil von `v1`:
   - kein `systemctl`
   - kein Shell-Fallback
@@ -212,6 +217,9 @@ allowed = [
 ]
 denied = []
 
+[filesystem]
+allowed_mounts = ["/", "/var"]
+
 [service_control]
 allowed_units = ["nginx.service", "ssh.service"]
 restart_cooldown_seconds = 300
@@ -236,9 +244,40 @@ Mögliche Match-Kriterien in `v1`:
 - `unix_user`
 - `unix_group`
 
+Nicht fuer Autorisierung vertrauenswuerdig in `v1.x`:
+
+- `requested_by.type`
+- `requested_by.id`
+- `allowed_request_types` als alleinige Rollentrennung fuer dieselbe OS-Identitaet
+
+### Deployment-Invariante fuer die Policy-Datei
+
+- `/etc/adminbot/policy.toml` ist ein sicherheitskritisches Artefakt
+- `adminbotd` startet fail closed, wenn die Datei
+  - nicht root-owned ist
+  - group-writable ist
+  - world-writable ist
+  - kein regulaeres File ist
+
+### Deployment-Invariante fuer Runtime-Verzeichnis und Socket
+
+- `/run/adminbot` ist ein sicherheitskritisches Laufzeit-Artefakt
+- `adminbotd` startet fail closed, wenn
+  - `/run/adminbot` nicht als echtes Verzeichnis vorliegt
+  - Owner oder Gruppe nicht zur Service-Identitaet passen
+  - der Modus nicht `0750` ist
+  - unter `/run/adminbot/adminbot.sock` ein nicht vertrauenswuerdiges Alt-Artefakt liegt
+- der Socket selbst muss nach dem Bind als Unix-Socket mit Owner `adminbot`, Gruppe `adminbotctl` und Modus `0660` vorliegen
+
 ### `actions`
 
 Globale Positivliste für den Daemon.
+
+### `filesystem`
+
+- kleine statische Whitelist fuer read-only Mountpoints
+- `allowed_mounts` definiert die einzigen fuer `disk.usage` erlaubten Mountpoints in `v1`
+- keine freie Dateisystemauswahl
 
 ### `service_control`
 
@@ -251,6 +290,7 @@ Globale Positivliste für den Daemon.
 ### `constraints`
 
 - globale technische Limits
+- `max_parallel_mutations` wird fuer mutierende Non-Dry-Run-Requests aktiv zur Laufzeit erzwungen
 - keine komplexe Regelsprache in `v1`
 
 ## Privilegierte Aktionsklassen
@@ -387,6 +427,7 @@ Mindestens zu loggen:
 ## Korrelation
 
 - `request_id` identifiziert genau einen AdminBot-Request
+- fuer mutierende Non-Dry-Run-Requests ist `request_id` zusaetzlich fuer ein kurzes, peer-gebundenes Replay-Fenster ein Idempotency-Key
 - `correlation_id` verknüpft mehrere Requests zu Incident, Task oder Agent-Lauf
 - `audit_ref` kommt in jede Response
 
@@ -411,6 +452,7 @@ Für `agent`-Requests zusätzlich sinnvoll:
 - `Agent-NN` bekommt keinen Shell-Bypass
 - `AdminBot` prüft lokal jede Anfrage
 - polkit ist keine Agent-NN-Eskalationsfläche, sondern nur eine schmale Systembrücke für den Service-Control-Pfad
+- die polkit-Vorlage darf nur den Service-User `adminbot` zulassen; Endnutzer bleiben auf die lokale IPC-Grenze beschränkt
 
 ### Konkrete Grenze
 

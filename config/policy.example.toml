@@ -2,7 +2,7 @@ version = 1
 
 [clients.local_cli]
 unix_user = "dev"
-allowed_capabilities = ["read_basic", "read_sensitive", "service_read"]
+allowed_capabilities = ["read_basic", "service_read"]
 
 [actions]
 allowed = [
@@ -12,11 +12,18 @@ allowed = [
   "disk.usage",
   "network.interface_status",
   "service.status",
-  "journal.query",
-  "process.snapshot",
-  "service.restart",
 ]
 denied = []
+
+# Opt-in only after explicit local security review:
+# - add "read_sensitive" only for trusted incident operators
+# - prefer "journal_read" over "read_sensitive" when only journald access is needed
+# - prefer "process_read" over "read_sensitive" when only process diagnostics are needed
+# - add "journal.query" only when journald exposure is really needed
+# - add "process.snapshot" only when process-level diagnostics are required
+# - prefer "service_restart" over "service_control" when only restart is intended
+# - add "service.restart" only together with "service_control" or "service_restart"
+# - if you enable "journal.query", define [journal].allowed_units explicitly
 
 [service_control]
 allowed_units = ["nginx.service"]
@@ -24,8 +31,19 @@ restart_cooldown_seconds = 300
 max_restarts_per_hour = 3
 
 [constraints]
+# Optional hardening profile:
+# security_profile = "high_security"
 default_timeout_ms = 3000
 max_timeout_ms = 30000
 journal_limit_max = 200
 process_limit_max = 50
 max_parallel_mutations = 1
+read_rate_limit_window_ms = 1000
+read_requests_per_peer_per_window = 30
+global_read_requests_per_window = 120
+mutate_rate_limit_window_ms = 60000
+mutate_requests_per_peer_per_window = 4
+global_mutate_requests_per_window = 12
+replay_window_ms = 300000
+# Optional: turn deterministic policy sanity warnings into startup failure.
+fail_on_sanity_warnings = false
